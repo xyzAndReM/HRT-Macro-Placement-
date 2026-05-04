@@ -1,7 +1,12 @@
 """
 Proxy cost computation using PlacementCost's ground truth evaluator.
 
-Wraps PlacementCost methods to compute wirelength, density, and congestion costs.
+Components returned by PlacementCost (used for ``proxy_cost`` and diagnostics):
+
+* **wirelength_cost** — normalized HPWL across all nets (``plc.get_cost()``).
+* **density_cost** — top 10% grid cell density (``plc.get_density_cost()``).
+* **congestion_cost** — top 5% routing congestion with smoothing (``plc.get_congestion_cost()``).
+
 Also computes overlap metrics for validation and analysis.
 """
 
@@ -120,6 +125,12 @@ def compute_proxy_cost(
 ) -> Dict[str, float]:
     """
     Compute proxy cost using PlacementCost's ground truth evaluator.
+
+    Sub-cost semantics (PlacementCost):
+
+    * ``wirelength_cost`` — normalized HPWL across all nets.
+    * ``density_cost`` — top 10% grid cell density.
+    * ``congestion_cost`` — top 5% routing congestion with smoothing.
 
     Args:
         placement: [num_macros, 2] tensor of (x, y) positions

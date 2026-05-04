@@ -27,12 +27,15 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
 ]
 
+# Torch from cu126 (CUDA 12.6 wheels include Pascal); cu128 default builds do not.
 dependencies = [
     "torch>=2.0.0",
     "numpy>=1.20.0",
     "matplotlib>=3.5.0",
     "tqdm>=4.65.0",
     "absl-py>=1.0.0",
+    "cvxpy>=1.4.0",
+    "osqp>=0.6.5",
 ]
 
 [project.optional-dependencies]
@@ -64,6 +67,14 @@ macro_place = ["py.typed"]
 [tool.black]
 line-length = 100
 target-version = ["py38", "py39", "py310", "py311", "py312"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
 
 [tool.pytest.ini_options]
 testpaths = ["test"]

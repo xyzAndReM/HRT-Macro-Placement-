@@ -1,8 +1,12 @@
 # Core dependencies
+# GPU (incl. Pascal): prefer uv + pyproject.toml [tool.uv] (torch from cu126).
+# Or: pip install torch --index-url https://download.pytorch.org/whl/cu126
 torch>=2.0.0
 absl-py>=1.0.0
 matplotlib>=3.3.0
 numpy>=1.19.0
+cvxpy>=1.4.0
+osqp>=0.6.5
 
 # Testing
 pytest>=7.0.0

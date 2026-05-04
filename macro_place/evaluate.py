@@ -16,9 +16,11 @@ import sys
 import time
 from pathlib import Path
 
+from macro_place.benchmark import Benchmark
 from macro_place.loader import load_benchmark, load_benchmark_from_dir
 from macro_place.objective import compute_proxy_cost
 from macro_place.utils import validate_placement, visualize_placement
+from macro_place._plc import PlacementCost
 
 # ── IBM ICCAD04 benchmark list ──────────────────────────────────────────────
 
@@ -107,6 +109,9 @@ def _load_placer(path: Path):
     path = path.resolve()
     if spec := importlib.util.spec_from_file_location(path.stem, str(path)):
         mod = importlib.util.module_from_spec(spec)
+        # Required before exec_module so dataclasses (and similar) can resolve
+        # cls.__module__ via sys.modules during class body execution.
+        sys.modules[spec.name] = mod
         spec.loader.exec_module(mod)
     else:
         raise RuntimeError(f"Failed to load placer from {path}")
@@ -128,15 +133,40 @@ def _load_placer(path: Path):
 # ── Single-benchmark evaluation ─────────────────────────────────────────────
 
 
-def evaluate_benchmark(placer, name: str, testcase_root: str, ng45_dir: str = None) -> dict:
-    """Run *placer* on a single benchmark and return a results dict."""
+def _proxy_delta_pct(initial: float, final: float) -> float:
+    """Percent change final vs initial (negative ⇒ proxy improved if lower is better)."""
+    if abs(initial) < 1e-30:
+        return 0.0
+    return (final - initial) / initial * 100.0
+
+
+def evaluate_benchmark(
+    placer,
+    name: str,
+    testcase_root: str,
+    ng45_dir: str = None,
+    *,
+    benchmark: Benchmark | None = None,
+    plc: PlacementCost | None = None,
+) -> dict:
+    """Run *placer* on a single benchmark and return a results dict.
+
+    If ``benchmark`` and ``plc`` are passed (e.g. after mutating positions in-place),
+    they are used instead of loading from disk.
+    """
     if ng45_dir:
         netlist_file = f"{ng45_dir}/netlist.pb.txt"
         plc_file = f"{ng45_dir}/initial.plc"
         benchmark, plc = load_benchmark(netlist_file, plc_file, name=name)
+    elif benchmark is not None:
+        if plc is None:
+            raise ValueError("plc is required when benchmark is provided")
     else:
         benchmark_dir = f"{testcase_root}/{name}"
         benchmark, plc = load_benchmark_from_dir(benchmark_dir)
+
+    initial_placement = benchmark.macro_positions.clone()
+    costs_initial = compute_proxy_cost(initial_placement, benchmark, plc)
 
     start = time.time()
     placement = placer.place(benchmark)
@@ -148,9 +178,13 @@ def evaluate_benchmark(placer, name: str, testcase_root: str, ng45_dir: str = No
     return {
         "name": name,
         "proxy_cost": costs["proxy_cost"],
+        "proxy_cost_initial": costs_initial["proxy_cost"],
         "wirelength": costs["wirelength_cost"],
+        "wirelength_initial": costs_initial["wirelength_cost"],
         "density": costs["density_cost"],
+        "density_initial": costs_initial["density_cost"],
         "congestion": costs["congestion_cost"],
+        "congestion_initial": costs_initial["congestion_cost"],
         "overlaps": costs["overlap_count"],
         "runtime": runtime,
         "valid": is_valid,
@@ -170,20 +204,25 @@ def _print_summary_table(results):
     has_baselines = any(r["sa_baseline"] is not None for r in results)
 
     print()
-    print("-" * 80)
+    print("-" * 96)
     if has_baselines:
         print(
-            f"{'Benchmark':>13}  {'Proxy':>8}  {'SA':>8}  {'RePlAce':>8}"
+            f"{'Benchmark':>13}  {'Proxy':>8}  {'Initial':>8}  {'Δ%':>7}"
+            f"  {'SA':>8}  {'RePlAce':>8}"
             f"  {'vs SA':>8}  {'vs RePlAce':>10}  {'Overlaps':>8}"
         )
     else:
         print(
-            f"{'Benchmark':>13}  {'Proxy':>8}  {'WL':>8}  {'Density':>8}"
+            f"{'Benchmark':>13}  {'Proxy':>8}  {'Initial':>8}  {'Δ%':>7}"
+            f"  {'WL':>8}  {'Density':>8}"
             f"  {'Congestion':>10}  {'Overlaps':>8}"
         )
-    print("-" * 80)
+    print("-" * 96)
 
     for r in results:
+        dpi = r["proxy_cost_initial"]
+        dp = r["proxy_cost"]
+        dlt = _proxy_delta_pct(dpi, dp)
         if has_baselines:
             vs_sa = (
                 ((r["sa_baseline"] - r["proxy_cost"]) / r["sa_baseline"] * 100)
@@ -198,18 +237,20 @@ def _print_summary_table(results):
             sa_str = f"{r['sa_baseline']:>8.4f}" if r["sa_baseline"] else f"{'—':>8}"
             rep_str = f"{r['replace_baseline']:>8.4f}" if r["replace_baseline"] else f"{'—':>8}"
             print(
-                f"{r['name']:>13}  {r['proxy_cost']:>8.4f}"
+                f"{r['name']:>13}  {dp:>8.4f}  {dpi:>8.4f}  {dlt:>+6.2f}"
                 f"  {sa_str}  {rep_str}"
                 f"  {vs_sa:>+7.1f}%  {vs_rep:>+9.1f}%  {r['overlaps']:>8}"
             )
         else:
             print(
-                f"{r['name']:>13}  {r['proxy_cost']:>8.4f}"
+                f"{r['name']:>13}  {dp:>8.4f}  {dpi:>8.4f}  {dlt:>+6.2f}"
                 f"  {r['wirelength']:>8.3f}  {r['density']:>8.3f}"
                 f"  {r['congestion']:>10.3f}  {r['overlaps']:>8}"
             )
 
     avg_proxy = sum(r["proxy_cost"] for r in results) / len(results)
+    avg_proxy_i = sum(r["proxy_cost_initial"] for r in results) / len(results)
+    avg_dlt = _proxy_delta_pct(avg_proxy_i, avg_proxy)
     total_overlaps = sum(r["overlaps"] for r in results)
     total_runtime = sum(r["runtime"] for r in results)
 
@@ -218,9 +259,10 @@ def _print_summary_table(results):
         baselines_rep = [r for r in results if r["replace_baseline"] is not None]
         avg_sa = sum(r["sa_baseline"] for r in baselines_sa) / len(baselines_sa) if baselines_sa else 0
         avg_rep = sum(r["replace_baseline"] for r in baselines_rep) / len(baselines_rep) if baselines_rep else 0
-        print("-" * 80)
+        print("-" * 96)
         print(
-            f"{'AVG':>13}  {avg_proxy:>8.4f}  {avg_sa:>8.4f}  {avg_rep:>8.4f}"
+            f"{'AVG':>13}  {avg_proxy:>8.4f}  {avg_proxy_i:>8.4f}  {avg_dlt:>+6.2f}"
+            f"  {avg_sa:>8.4f}  {avg_rep:>8.4f}"
             f"  {(avg_sa - avg_proxy) / avg_sa * 100:>+7.1f}%"
             f"  {(avg_rep - avg_proxy) / avg_rep * 100:>+9.1f}%  {total_overlaps:>8}"
         )
@@ -228,9 +270,9 @@ def _print_summary_table(results):
         avg_wl = sum(r["wirelength"] for r in results) / len(results)
         avg_den = sum(r["density"] for r in results) / len(results)
         avg_cong = sum(r["congestion"] for r in results) / len(results)
-        print("-" * 80)
+        print("-" * 96)
         print(
-            f"{'AVG':>13}  {avg_proxy:>8.4f}"
+            f"{'AVG':>13}  {avg_proxy:>8.4f}  {avg_proxy_i:>8.4f}  {avg_dlt:>+6.2f}"
             f"  {avg_wl:>8.3f}  {avg_den:>8.3f}"
             f"  {avg_cong:>10.3f}  {total_overlaps:>8}"
         )
@@ -317,8 +359,11 @@ def main():
             if result["overlaps"] == 0
             else f"INVALID ({result['overlaps']} overlaps)"
         )
+        dpi = result["proxy_cost_initial"]
+        dp = result["proxy_cost"]
+        dlt = _proxy_delta_pct(dpi, dp)
         print(
-            f"proxy={result['proxy_cost']:.4f}  "
+            f"proxy={dp:.4f}  initial={dpi:.4f}  Δ={dlt:+.2f}%  "
             f"(wl={result['wirelength']:.3f} den={result['density']:.3f} cong={result['congestion']:.3f})  "
             f"{status}  [{result['runtime']:.2f}s]"
         )

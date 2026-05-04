@@ -176,6 +176,9 @@ def load_benchmark(
     num_nets = len(net_nodes)
     net_weights_tensor = torch.tensor(net_weights_list, dtype=torch.float32) if net_weights_list else torch.zeros(0, dtype=torch.float32)
 
+    h_ralloc, v_ralloc = plc.get_macro_routing_allocation()
+    smooth_rng = int(plc.get_congestion_smooth_range())
+
     # Create Benchmark object
     benchmark = Benchmark(
         name=name,
@@ -195,6 +198,9 @@ def load_benchmark(
         grid_cols=grid_cols,
         hroutes_per_micron=hroutes_per_micron,
         vroutes_per_micron=vroutes_per_micron,
+        congestion_smooth_range=smooth_rng,
+        hrouting_alloc=float(h_ralloc),
+        vrouting_alloc=float(v_ralloc),
         port_positions=port_positions,
         macro_pin_offsets=macro_pin_offsets,
         net_pin_nodes=net_pin_nodes,

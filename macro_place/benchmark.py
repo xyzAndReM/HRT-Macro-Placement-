@@ -72,6 +72,11 @@ class Benchmark:
     hroutes_per_micron: float = 11.285  # Horizontal routing tracks per micron
     vroutes_per_micron: float = 12.605  # Vertical routing tracks per micron
 
+    # PLC metadata (from ``initial.plc`` comments via PlacementCost)
+    congestion_smooth_range: int = 2
+    hrouting_alloc: float = 1.0  # horizontal routing blocked per micron of vertical overlap
+    vrouting_alloc: float = 1.0  # vertical routing blocked per micron of horizontal overlap
+
     # PlacementCost mapping (tensor index → PlacementCost module index)
     hard_macro_indices: List[int] = field(default_factory=list)
     soft_macro_indices: List[int] = field(default_factory=list)
@@ -136,6 +141,9 @@ class Benchmark:
                 "grid_cols": self.grid_cols,
                 "hroutes_per_micron": self.hroutes_per_micron,
                 "vroutes_per_micron": self.vroutes_per_micron,
+                "congestion_smooth_range": self.congestion_smooth_range,
+                "hrouting_alloc": self.hrouting_alloc,
+                "vrouting_alloc": self.vrouting_alloc,
                 "port_positions": self.port_positions,
                 "macro_pin_offsets": self.macro_pin_offsets,
                 "net_pin_nodes": self.net_pin_nodes,
@@ -161,6 +169,12 @@ class Benchmark:
             data["macro_pin_offsets"] = []
         if "net_pin_nodes" not in data:
             data["net_pin_nodes"] = []
+        if "congestion_smooth_range" not in data:
+            data["congestion_smooth_range"] = 2
+        if "hrouting_alloc" not in data:
+            data["hrouting_alloc"] = 1.0
+        if "vrouting_alloc" not in data:
+            data["vrouting_alloc"] = 1.0
         return cls(**data)
 
     def get_movable_mask(self) -> torch.Tensor:
