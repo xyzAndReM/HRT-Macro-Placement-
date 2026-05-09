@@ -1,5 +1,10 @@
 """
-Gradient-based macro placement:
+Gradient-based macro placement (``gradient2.py`` variant):
+
+Capacity-style **ReLU** gates are replaced with **softplus** where density or RUDY
+congestion measures excess above a threshold—``softplus(x - threshold)`` is close to
+``relu(x - threshold)`` when far above the limit, but keeps a **continuous nonzero
+gradient** below it so bins approaching the limit still receive optimizer signal.
 
 Surrogate losses (differentiable) vs ``compute_proxy_cost`` / PlacementCost:
 
@@ -26,8 +31,8 @@ proxy when evaluated, weights used that epoch, ``delta_proxy``, ``adapt_step``);
 ``logs_plot.png`` overlays proxy on surrogate curves.
 
 Usage:
-    uv run evaluate submissions/gradient.py -b ibm01
-    uv run python submissions/gradient.py
+    uv run evaluate submissions/gradient2.py -b ibm01
+    uv run python submissions/gradient2.py
 """
 
 from __future__ import annotations
@@ -46,6 +51,8 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 from macro_place.benchmark import Benchmark
 from macro_place.loader import load_benchmark_from_dir
@@ -75,6 +82,11 @@ def _resolve_user_path(p: str | Path | None) -> Path | None:
         return None
     path = Path(p)
     return path if path.is_absolute() else Path.cwd() / path
+
+
+def _soft_capacity_excess(excess: torch.Tensor) -> torch.Tensor:
+    """``softplus(excess)`` as a smooth stand-in for ``relu(excess)`` (``excess = x - threshold``)."""
+    return F.softplus(excess)
 
 
 # Per-epoch diagnostic CSV columns (after ``epoch``); see ``GradientPlacer.epoch_timing_diagnostic``.
@@ -602,7 +614,7 @@ def _vectorized_gaussian_density_loss(
     ey = dy * dy / (2.0 * sy_b * sy_b + stabil)
     g = torch.exp(-ex - ey) * mask.to(dtype)
     rho = g.sum(dim=0)
-    overflow = torch.relu(rho - target)
+    overflow = _soft_capacity_excess(rho - target)
     return (overflow * overflow).sum()
 
 
@@ -677,7 +689,7 @@ def _density_loss_fast(
     ey = dy * dy * inv_2sy2
     g = torch.exp(-ex - ey) * mask.to(full_pos.dtype)
     rho = g.sum(dim=0)
-    overflow = torch.relu(rho - target)
+    overflow = _soft_capacity_excess(rho - target)
     return (overflow * overflow).sum()
 
 
@@ -728,7 +740,6 @@ def _plc_macro_overlap_density_grid(
     if n == 0:
         return torch.zeros(nr, nc, device=device, dtype=dtype)
 
-    dens = torch.zeros(nr, nc, device=device, dtype=dtype)
     # Peak memory for full broadcast is O(M * nr * nc); chunk macros when too large.
     max_elems = 256 * 1024 * 1024
     bin_cells = nr * nc
@@ -741,6 +752,7 @@ def _plc_macro_overlap_density_grid(
     by0_b = by0.unsqueeze(0)
     by1_b = by1.unsqueeze(0)
 
+    chunk_results: list[torch.Tensor] = []
     for start in range(0, n, chunk):
         end = min(start + chunk, n)
         cx = full_pos[start:end, 0].view(-1, 1, 1)
@@ -753,8 +765,8 @@ def _plc_macro_overlap_density_grid(
         ty_m = cy + 0.5 * h
         ix0 = torch.relu(torch.minimum(rx, bx1_b) - torch.maximum(lx, bx0_b))
         iy0 = torch.relu(torch.minimum(ty_m, by1_b) - torch.maximum(by_m, by0_b))
-        dens = dens + (ix0 * iy0).sum(dim=0) / bin_area
-    return dens
+        chunk_results.append((ix0 * iy0).sum(dim=0))
+    return torch.stack(chunk_results).sum(dim=0) / bin_area
 
 
 def _rudy_loss_loop(
@@ -816,7 +828,7 @@ def _rudy_loss_loop(
         overlap = ox * oy
         demand = demand + weights[k] * overlap / area
 
-    overflow = torch.relu(demand - 1.0)
+    overflow = _soft_capacity_excess(demand - 1.0)
     return (overflow * overflow).sum()
 
 
@@ -919,7 +931,7 @@ def _rudy_loss_v2(
         bin_y0,
         bin_y1,
     )
-    overflow = torch.relu(demand - 1.0)
+    overflow = _soft_capacity_excess(demand - 1.0)
     return (overflow * overflow).sum()
 
 
@@ -1122,6 +1134,10 @@ class GradientPlacer:
     Optional ``epoch_timing_diagnostic`` path: per-epoch CSV + summary (CUDA-synchronized
     segment times in seconds) for profiling assemble / surrogates / backward / optimizer / proxy.
 
+    Learning rate: by default ``CosineAnnealingWarmRestarts`` on Adam (``T_0=250``, ``T_mult=1``,
+    ``eta_min=0``) so LR periodically returns toward the base rate after cosine decay; disable with
+    ``use_cosine_restarts=False``.
+
     Surrogate terms match PlacementCost **structure** (normalized WL, top-10% density,
     top-5% congestion via PLC-aligned routing surrogate by default). Default coefficients match ``compute_proxy_cost``:
     ``w_wl=1.0``, ``w_dens_hard=0.5``, ``w_cong=0.5``. Optional ``proxy_adaptive_weights``
@@ -1158,6 +1174,10 @@ class GradientPlacer:
         training_log_plot: str | Path | None = "logs_plot.png",
         use_plc_routing_cong: bool = True,
         epoch_timing_diagnostic: str | Path | None = None,
+        use_cosine_restarts: bool = True,
+        lr_cosine_T_0: int = 250,
+        lr_cosine_T_mult: int = 1,
+        lr_cosine_eta_min: float = 0.0,
     ):
         self.epochs = int(epochs)
         self.lr = float(lr)
@@ -1186,6 +1206,10 @@ class GradientPlacer:
         self.training_log_plot = training_log_plot
         self.use_plc_routing_cong = bool(use_plc_routing_cong)
         self.epoch_timing_diagnostic = epoch_timing_diagnostic
+        self.use_cosine_restarts = bool(use_cosine_restarts)
+        self.lr_cosine_T_0 = int(lr_cosine_T_0)
+        self.lr_cosine_T_mult = int(lr_cosine_T_mult)
+        self.lr_cosine_eta_min = float(lr_cosine_eta_min)
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         torch.manual_seed(self.seed)
@@ -1225,6 +1249,14 @@ class GradientPlacer:
         if not params:
             return benchmark.macro_positions.clone()
         opt = torch.optim.Adam(params, lr=self.lr)
+        lr_scheduler: CosineAnnealingWarmRestarts | None = None
+        if self.use_cosine_restarts and self.lr_cosine_T_0 > 0:
+            lr_scheduler = CosineAnnealingWarmRestarts(
+                opt,
+                T_0=self.lr_cosine_T_0,
+                T_mult=self.lr_cosine_T_mult,
+                eta_min=self.lr_cosine_eta_min,
+            )
 
         w_wl_dyn = float(self.w_wl)
         w_dh_dyn = float(self.w_dens_hard)
@@ -1524,7 +1556,7 @@ class GradientPlacer:
                             bin_y0,
                             bin_y1,
                         )
-                        overflow = torch.relu(demand - 1.0)
+                        overflow = _soft_capacity_excess(demand - 1.0)
                         l_cong = _abu_top_mean(overflow, 0.05)
     
                 if epoch == 0 and using_compiled and not self.use_plc_routing_cong:
@@ -1588,7 +1620,19 @@ class GradientPlacer:
                 with _diag_segment(row, "t_backward", device):
                     loss.backward()
                 with _diag_segment(row, "t_optimizer", device):
+                    lr_before = opt.param_groups[0]["lr"]
                     opt.step()
+                    if lr_scheduler is not None:
+                        lr_scheduler.step()
+                        lr_after = opt.param_groups[0]["lr"]
+                        if lr_after > lr_before + 1e-9:
+                            for group in opt.param_groups:
+                                for p in group["params"]:
+                                    st = opt.state[p]
+                                    if "exp_avg" in st:
+                                        st["exp_avg"].zero_()
+                                    if "exp_avg_sq" in st:
+                                        st["exp_avg_sq"].zero_()
 
                 with _diag_segment(row, "t_clamp", device):
                     _clamp_movable_fast(pos_hard, pos_soft, clamp_ctx)
@@ -1651,7 +1695,7 @@ class GradientPlacer:
                                     bin_y0,
                                     bin_y1,
                                 )
-                                overflow_ev = torch.relu(demand_ev - 1.0)
+                                overflow_ev = _soft_capacity_excess(demand_ev - 1.0)
                                 l_cong_ev = _abu_top_mean(overflow_ev, 0.05)
                             sw = float(l_wl_ev.item())
                             sdh = float(l_dh_ev.item())

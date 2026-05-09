@@ -5,7 +5,7 @@ Pure PyTorch tensor representation of placement benchmarks.
 """
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 import torch
 
 
@@ -85,6 +85,13 @@ class Benchmark:
     num_hard_macros: int = 0
     num_soft_macros: int = 0
 
+    # PlacementCost ``net_cnt``: Σ source weights for ``get_cost`` denominator (W+H)×net_cnt.
+    # When ≤ 0 (unset / old snapshots), ``__post_init__`` falls back to ``max(num_nets, 1)``.
+    wl_normalize_weight_sum: float = 0.0
+
+    # Driver-pin ``get_weight()`` per net (routing / pin HPWL); optional for old .pt files.
+    net_driver_weights: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         """Validate tensor shapes and set counts."""
         # Backwards compat: if num_hard_macros not set, all macros are hard
@@ -119,6 +126,13 @@ class Benchmark:
         assert self.net_weights.shape == (self.num_nets,), (
             f"net_weights shape {self.net_weights.shape} != ({self.num_nets},)"
         )
+        if self.net_driver_weights is not None:
+            assert self.net_driver_weights.shape == (self.num_nets,), (
+                f"net_driver_weights shape {self.net_driver_weights.shape} != ({self.num_nets},)"
+            )
+
+        if self.wl_normalize_weight_sum <= 0.0:
+            self.wl_normalize_weight_sum = float(max(self.num_nets, 1))
 
     def save(self, path: str):
         """Save benchmark to .pt file."""
@@ -137,6 +151,8 @@ class Benchmark:
                 "num_nets": self.num_nets,
                 "net_nodes": self.net_nodes,
                 "net_weights": self.net_weights,
+                "net_driver_weights": self.net_driver_weights,
+                "wl_normalize_weight_sum": self.wl_normalize_weight_sum,
                 "grid_rows": self.grid_rows,
                 "grid_cols": self.grid_cols,
                 "hroutes_per_micron": self.hroutes_per_micron,
@@ -175,6 +191,10 @@ class Benchmark:
             data["hrouting_alloc"] = 1.0
         if "vrouting_alloc" not in data:
             data["vrouting_alloc"] = 1.0
+        if "wl_normalize_weight_sum" not in data:
+            data["wl_normalize_weight_sum"] = 0.0
+        if "net_driver_weights" not in data:
+            data["net_driver_weights"] = None
         return cls(**data)
 
     def get_movable_mask(self) -> torch.Tensor:

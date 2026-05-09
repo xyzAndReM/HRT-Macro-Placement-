@@ -149,6 +149,7 @@ def load_benchmark(
     net_nodes = []
     net_pin_nodes = []
     net_weights_list = []
+    net_driver_weights_list = []
     for driver, sinks in plc.nets.items():
         pins_in_net = []  # list of [owner_bench_idx, pin_slot]
         nodes_in_net = set()
@@ -172,9 +173,16 @@ def load_benchmark(
             net_nodes.append(torch.tensor(sorted(nodes_in_net), dtype=torch.long))
             net_pin_nodes.append(torch.tensor(pins_in_net, dtype=torch.long))
             net_weights_list.append(1.0)
+            drv_idx = plc.mod_name_to_indices[driver]
+            net_driver_weights_list.append(float(plc.modules_w_pins[drv_idx].get_weight()))
 
     num_nets = len(net_nodes)
     net_weights_tensor = torch.tensor(net_weights_list, dtype=torch.float32) if net_weights_list else torch.zeros(0, dtype=torch.float32)
+    net_driver_weights_tensor = (
+        torch.tensor(net_driver_weights_list, dtype=torch.float32)
+        if net_driver_weights_list
+        else None
+    )
 
     h_ralloc, v_ralloc = plc.get_macro_routing_allocation()
     smooth_rng = int(plc.get_congestion_smooth_range())
@@ -194,6 +202,7 @@ def load_benchmark(
         num_nets=num_nets,
         net_nodes=net_nodes,
         net_weights=net_weights_tensor,
+        net_driver_weights=net_driver_weights_tensor,
         grid_rows=grid_rows,
         grid_cols=grid_cols,
         hroutes_per_micron=hroutes_per_micron,
@@ -206,6 +215,7 @@ def load_benchmark(
         net_pin_nodes=net_pin_nodes,
         hard_macro_indices=hard_macro_plc_indices,
         soft_macro_indices=soft_macro_plc_indices,
+        wl_normalize_weight_sum=float(plc.net_cnt),
     )
 
     return benchmark, plc

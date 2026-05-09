@@ -105,6 +105,10 @@ def test_benchmark_save_load_roundtrip(ibm01, tmp_path):
     benchmark.save(str(out))
     loaded = Benchmark.load(str(out))
 
+    assert loaded.wl_normalize_weight_sum == benchmark.wl_normalize_weight_sum
+    if benchmark.net_driver_weights is not None:
+        assert loaded.net_driver_weights is not None
+        assert torch.equal(loaded.net_driver_weights, benchmark.net_driver_weights)
     assert len(loaded.net_pin_nodes) == len(benchmark.net_pin_nodes)
     for a, b in zip(loaded.net_pin_nodes, benchmark.net_pin_nodes):
         assert torch.equal(a, b)

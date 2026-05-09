@@ -1,33 +1,11 @@
 """
-Gradient-based macro placement:
+**gradient3** — local-refinement placer: SGD+Nesterov, β/softplus scheduling, top-percentile
+hotspots, optional narrow Gaussian density, QP lookahead, surrogate–proxy correlation plot.
 
-Surrogate losses (differentiable) vs ``compute_proxy_cost`` / PlacementCost:
-
-* **Wirelength surrogate:** weighted HPWL ``(max - min)`` on pins, then **÷ ((canvas_w +
-  canvas_h) × num_nets)** to match PlacementCost ``get_cost()`` normalization.
-* **Density surrogate:** macro rectangle overlap / bin area on the placement grid, then
-  **average of top 10% bin densities × 0.5** (same reduction as ``get_density_cost()``).
-* **Congestion surrogate (default):** PLC-style **L-route net demand** + **normalized macro
-  blockage**, **smooth net maps** then add macro (matching PlacementCost ``get_routing`` order),
-  then **mean of top 5%** over all H/V cells like ``abu(V+H, 0.05)``. Set ``use_plc_routing_cong=False``
-  for the legacy LSE RUDY overflow surrogate.
-
-Adam optimization and optional QP legalization on hard macros.
-
-Training can stop early on wall time, repeated lack of evaluator-proxy improvement (patience),
-or (after ``loss_flat_min_epoch``) flat surrogate loss; otherwise it runs for ``epochs``.
-When evaluator proxy was computed, the returned placement is the best proxy seen.
-Default surrogate weights match the evaluator proxy: ``1.0·l_wl + 0.5·l_dh + 0.5·l_cong``
-(same coefficients as ``proxy_cost``). Optional **proxy-guided** adjustment trades ``w_wl``
-vs ``w_cong`` using proxy deltas between checkpoints; disable with ``proxy_adaptive_weights=False``
-to keep the formula coefficients fixed.
-Append-only CSV training metrics default to ``logs.txt`` (surrogate ``l_*``, total loss,
-proxy when evaluated, weights used that epoch, ``delta_proxy``, ``adapt_step``); optional
-``logs_plot.png`` overlays proxy on surrogate curves.
+See module source and ``Gradient3Placer`` for parameters.
 
 Usage:
-    uv run evaluate submissions/gradient.py -b ibm01
-    uv run python submissions/gradient.py
+    uv run python submissions/gradient3.py
 """
 
 from __future__ import annotations
@@ -46,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from macro_place.benchmark import Benchmark
 from macro_place.loader import load_benchmark_from_dir
@@ -77,7 +56,269 @@ def _resolve_user_path(p: str | Path | None) -> Path | None:
     return path if path.is_absolute() else Path.cwd() / path
 
 
-# Per-epoch diagnostic CSV columns (after ``epoch``); see ``GradientPlacer.epoch_timing_diagnostic``.
+def _soft_capacity_excess(excess: torch.Tensor, sharpness: float = 1.0) -> torch.Tensor:
+    """Scaled softplus: ``softplus(s·x)/s`` — larger ``sharpness`` approaches a hard hinge."""
+    s = float(sharpness)
+    if s <= 0.0:
+        s = 1.0
+    return F.softplus(s * excess) / s
+
+
+def _sched_exponential_beta(epoch: int, epochs: int, beta0: float, end_ratio: float) -> float:
+    """β grows exponentially from ``beta0`` to ``beta0 * end_ratio`` over training."""
+    if epochs <= 1:
+        return float(beta0)
+    t = float(epoch) / float(epochs - 1)
+    return float(beta0) * (float(end_ratio) ** t)
+
+
+def _sched_sigma_local(epoch: int, epochs: int, sigma0: float, sigma1: float) -> float:
+    """Linear schedule for Gaussian σ multipliers (local narrowing over time)."""
+    if epochs <= 1:
+        return float(sigma0)
+    t = float(epoch) / float(epochs - 1)
+    return float(sigma0) + t * (float(sigma1) - float(sigma0))
+
+
+# Float32-safe L-route area denominator inside RUDY (avoid NaNs without biasing WL).
+_RUDY_AREA_EPS = 1e-6
+
+
+def _macro_connectivity_row_mult(
+    benchmark: Benchmark,
+    macro_indices: list[int],
+    device: torch.device,
+    dtype: torch.dtype,
+    boost: float,
+) -> torch.Tensor | None:
+    """Per-macro σ multipliers ``1 + boost * norm_degree`` for Gaussian density kernels."""
+    if boost <= 0.0 or not macro_indices:
+        return None
+    M = len(macro_indices)
+    g2l = {int(g): i for i, g in enumerate(macro_indices)}
+    counts = [0] * M
+    for k in range(int(benchmark.num_nets)):
+        nodes = benchmark.net_nodes[k]
+        for t in range(int(nodes.numel())):
+            gi = int(nodes[t].item())
+            j = g2l.get(gi)
+            if j is not None:
+                counts[j] += 1
+    c = torch.tensor(counts, device=device, dtype=dtype)
+    cmax = float(c.max().item()) if M > 0 else 1.0
+    nrm = c / (float(cmax) + 1e-6)
+    return 1.0 + float(boost) * nrm
+
+
+def _rudy_nets_active_mask(
+    combined_pos: torch.Tensor,
+    net_idx: torch.Tensor,
+    net_mask: torch.Tensor,
+    dens_grid: torch.Tensor,
+    hotspot_frac: float,
+    cw: float,
+    ch: float,
+) -> torch.Tensor:
+    """Nets with at least one pin in a top-``hotspot_frac`` density bin (cheap congestion focus)."""
+    nr, nc = dens_grid.shape
+    device = combined_pos.device
+    flat = dens_grid.reshape(-1)
+    n = int(flat.numel())
+    num_nets = int(net_idx.shape[0])
+    if n == 0:
+        return torch.ones(num_nets, device=device, dtype=torch.bool)
+    hf = min(max(float(hotspot_frac), 1e-6), 1.0)
+    k = max(1, int(math.floor(n * hf)))
+    thr = torch.topk(flat, min(k, n), largest=True).values.min()
+    hot = dens_grid >= thr
+    cell_w = cw / float(nc)
+    cell_h = ch / float(nr)
+    pi = net_idx.clamp(min=0)
+    cx = combined_pos[pi, 0]
+    cy = combined_pos[pi, 1]
+    ci = (cx / cell_w).long().clamp(0, nc - 1)
+    ri = (cy / cell_h).long().clamp(0, nr - 1)
+    touch = hot[ri, ci] & net_mask
+    active = touch.any(dim=1)
+    if not bool(active.any()):
+        return torch.ones(num_nets, device=device, dtype=torch.bool)
+    return active
+
+
+def _build_pin_gather_tensors(
+    benchmark: Benchmark,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Indices into ``combined_pos`` and macro-local offsets for every pin (see ``Benchmark.net_pin_nodes``)."""
+    n_m = int(benchmark.num_macros)
+    n_ports = int(benchmark.port_positions.shape[0])
+    owners: list[int] = []
+    offs: list[list[float]] = []
+
+    if len(benchmark.net_pin_nodes) == int(benchmark.num_nets):
+        for k in range(int(benchmark.num_nets)):
+            pn = benchmark.net_pin_nodes[k]
+            for r in range(int(pn.shape[0])):
+                o = int(pn[r, 0].item())
+                s = int(pn[r, 1].item())
+                owners.append(o)
+                if o < n_m:
+                    mo_list = benchmark.macro_pin_offsets
+                    if (
+                        o < len(mo_list)
+                        and mo_list[o].numel() > 0
+                        and s < mo_list[o].shape[0]
+                    ):
+                        off = mo_list[o][s].to(dtype=torch.float32)
+                        offs.append([float(off[0].item()), float(off[1].item())])
+                    else:
+                        offs.append([0.0, 0.0])
+                else:
+                    offs.append([0.0, 0.0])
+        if not owners:
+            return None
+        pin_owner = torch.tensor(owners, device=device, dtype=torch.long)
+        pin_off = torch.tensor(offs, device=device, dtype=dtype)
+        return pin_owner, pin_off
+
+    owners = list(range(n_m)) + [n_m + j for j in range(n_ports)]
+    pin_owner = torch.tensor(owners, device=device, dtype=torch.long)
+    pin_off = torch.zeros(len(owners), 2, device=device, dtype=dtype)
+    return pin_owner, pin_off
+
+
+def _compute_pin_demand_grid(
+    combined_pos: torch.Tensor,
+    pin_owner: torch.Tensor,
+    pin_off: torch.Tensor,
+    nr: int,
+    nc: int,
+    cw: float,
+    ch: float,
+    sigma_pin: float,
+    max_elems: int = 256 * 1024 * 1024,
+) -> torch.Tensor:
+    """Gaussian pin-density map on an ``nr``×``nc`` canvas (same orientation as RUDY bins)."""
+    device = combined_pos.device
+    dtype = combined_pos.dtype
+    rs = torch.arange(nr, device=device, dtype=dtype).view(nr, 1).expand(nr, nc)
+    cs = torch.arange(nc, device=device, dtype=dtype).view(1, nc).expand(nr, nc)
+    cx_bin = (cs + 0.5) * (cw / float(nc))
+    cy_bin = (rs + 0.5) * (ch / float(nr))
+    pin_pos = combined_pos[pin_owner] + pin_off
+    pcount = int(pin_pos.shape[0])
+    s2 = 2.0 * (float(sigma_pin) ** 2)
+    if s2 <= 1e-18:
+        s2 = 1e-6
+    px = pin_pos[:, 0]
+    py = pin_pos[:, 1]
+    bin_cells = nr * nc
+    chunk = pcount
+    if pcount * bin_cells > max_elems and bin_cells > 0:
+        chunk = max(1, max_elems // bin_cells)
+    acc = torch.zeros(nr, nc, device=device, dtype=dtype)
+    for start in range(0, pcount, chunk):
+        end = min(start + chunk, pcount)
+        dx = px[start:end].view(-1, 1, 1) - cx_bin.unsqueeze(0)
+        dy = py[start:end].view(-1, 1, 1) - cy_bin.unsqueeze(0)
+        acc = acc + torch.exp(-(dx * dx + dy * dy) / s2).sum(dim=0)
+    return acc
+
+
+def _refinement_rudy_pin_cong_loss(
+    rudy_demand: torch.Tensor,
+    pin_demand: torch.Tensor,
+    *,
+    pin_weight: float,
+    util_threshold: float,
+    overflow_sharpness: float,
+    top_k_frac: float,
+) -> torch.Tensor:
+    """RUDY + normalized pin pressure, soft overflow above ``util_threshold``, ABU top-mean."""
+    pin_n = pin_demand / (pin_demand.amax() + 1e-8)
+    total = rudy_demand + float(pin_weight) * pin_n
+    overflow = _soft_capacity_excess(
+        total - float(util_threshold), sharpness=float(overflow_sharpness)
+    )
+    return _abu_top_mean(overflow, float(top_k_frac))
+
+
+def _nesterov_momentum_restart(optimizer: torch.optim.Optimizer) -> None:
+    """O'Donoghue–Candes style: zero momentum when it disagrees with the new gradient."""
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            st = optimizer.state.get(p)
+            if st is None or "momentum_buffer" not in st:
+                continue
+            buf = st["momentum_buffer"]
+            g = p.grad.detach()
+            if torch.dot(buf.flatten(), g.flatten()) < 0:
+                buf.zero_()
+
+
+def _zero_sgd_momentum(optimizer: torch.optim.Optimizer) -> None:
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            st = optimizer.state.get(p)
+            if st is None or "momentum_buffer" not in st:
+                continue
+            st["momentum_buffer"].zero_()
+
+
+def _scatter_legal_placement_into_params(
+    placement_cpu: torch.Tensor,
+    pos_hard: nn.Parameter,
+    pos_soft: nn.Parameter,
+    movable_hard_idx: list[int],
+    n_hard: int,
+    n_macros: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Load CPU placement tensor into ``pos_hard`` / ``pos_soft`` (movable rows only)."""
+    ph = placement_cpu.to(device=device, dtype=dtype)
+    with torch.no_grad():
+        for r, gi in enumerate(movable_hard_idx):
+            pos_hard[r].copy_(ph[gi])
+        if pos_soft.numel() > 0:
+            pos_soft.copy_(ph[n_hard:n_macros])
+
+
+def _write_surrogate_proxy_corr_plot(
+    plot_path: Path,
+    surrogate_vals: list[float],
+    proxy_vals: list[float],
+) -> None:
+    """Scatter surrogate total loss vs evaluator proxy at checkpoints."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    if len(surrogate_vals) < 2 or len(proxy_vals) < 2:
+        return
+    if len(surrogate_vals) != len(proxy_vals):
+        return
+    s = np.asarray(surrogate_vals, dtype=np.float64)
+    p = np.asarray(proxy_vals, dtype=np.float64)
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.scatter(s, p, s=14, alpha=0.75)
+    ax.set_xlabel("weighted surrogate at checkpoint")
+    ax.set_ylabel("evaluator proxy")
+    ax.set_title("Surrogate vs proxy (checkpoints)")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=120)
+    plt.close(fig)
+
+
+# Per-epoch diagnostic CSV columns (after ``epoch``); see ``Gradient3Placer.epoch_timing_diagnostic``.
 _EPOCH_DIAG_NUMERIC_COLS: tuple[str, ...] = (
     "t_zero_grad",
     "t_assemble",
@@ -94,6 +335,7 @@ _EPOCH_DIAG_NUMERIC_COLS: tuple[str, ...] = (
     "t_optimizer",
     "t_clamp",
     "t_proxy_checkpoint",
+    "t_qp_lookahead",
     "t_epoch_wall_s",
 )
 
@@ -308,7 +550,7 @@ def _write_gradient_log_plot(
     ax_bot.grid(True, alpha=0.3)
     ax_bot.legend(loc="upper right", fontsize=8)
 
-    fig.suptitle("GradientPlacer training log")
+    fig.suptitle("Gradient3Placer training log")
     fig.tight_layout()
     fig.savefig(plot_path, dpi=120)
     plt.close(fig)
@@ -602,7 +844,7 @@ def _vectorized_gaussian_density_loss(
     ey = dy * dy / (2.0 * sy_b * sy_b + stabil)
     g = torch.exp(-ex - ey) * mask.to(dtype)
     rho = g.sum(dim=0)
-    overflow = torch.relu(rho - target)
+    overflow = _soft_capacity_excess(rho - target)
     return (overflow * overflow).sum()
 
 
@@ -611,6 +853,8 @@ def _build_density_ctx(
     macro_indices: list[int],
     device: torch.device,
     dtype: torch.dtype,
+    sigma_scale: float = 1.0,
+    connectivity_row_mult: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -638,8 +882,16 @@ def _build_density_ctx(
 
     sizes = benchmark.macro_sizes.to(device=device, dtype=dtype)
     idx_t = torch.tensor(macro_indices, device=device, dtype=torch.long)
-    sx = sizes[idx_t, 0] * 0.5
-    sy = sizes[idx_t, 1] * 0.5
+    sig = float(sigma_scale)
+    if sig <= 0.0:
+        sig = 1.0
+    sx = sizes[idx_t, 0] * 0.5 * sig
+    sy = sizes[idx_t, 1] * 0.5 * sig
+    if connectivity_row_mult is not None:
+        m = connectivity_row_mult.to(device=device, dtype=dtype).view(-1)
+        if m.shape[0] == sx.shape[0]:
+            sx = sx * m
+            sy = sy * m
     M = idx_t.shape[0]
     sx_b = sx.view(M, 1, 1)
     sy_b = sy.view(M, 1, 1)
@@ -663,6 +915,7 @@ def _density_loss_fast(
         torch.Tensor | None,
         torch.Tensor | None,
     ],
+    sharpness: float = 1.0,
 ) -> torch.Tensor:
     """Equivalent to ``_vectorized_gaussian_density_loss`` with per-place constants hoisted."""
     bx, by, idx_t, three_sx, three_sy, inv_2sx2, inv_2sy2 = ctx
@@ -677,7 +930,7 @@ def _density_loss_fast(
     ey = dy * dy * inv_2sy2
     g = torch.exp(-ex - ey) * mask.to(full_pos.dtype)
     rho = g.sum(dim=0)
-    overflow = torch.relu(rho - target)
+    overflow = _soft_capacity_excess(rho - target, sharpness=sharpness)
     return (overflow * overflow).sum()
 
 
@@ -692,13 +945,16 @@ def _abu_top_mean(values: torch.Tensor, frac: float) -> torch.Tensor:
     return torch.topk(flat, k, largest=True).values.mean()
 
 
-def _plc_style_density_from_grid(dens: torch.Tensor) -> torch.Tensor:
-    """Top-10% bin-density average × 0.5 — matches ``PlacementCost.get_density_cost`` structure."""
+def _plc_style_density_from_grid(
+    dens: torch.Tensor, top_frac: float = 0.1
+) -> torch.Tensor:
+    """Top-``top_frac`` bin-density average × 0.5 — ``PlacementCost.get_density_cost``-like."""
     flat = dens.reshape(-1).clamp(min=0)
     ncells = int(flat.numel())
     if ncells == 0:
         return torch.zeros((), device=flat.device, dtype=flat.dtype)
-    density_cnt = max(1, int(math.floor(ncells * 0.1)))
+    tf = min(max(float(top_frac), 1e-6), 1.0)
+    density_cnt = max(1, int(math.floor(ncells * tf)))
     k = min(density_cnt, ncells)
     top = torch.topk(flat, k, largest=True).values
     return 0.5 * top.sum() / float(density_cnt)
@@ -728,7 +984,6 @@ def _plc_macro_overlap_density_grid(
     if n == 0:
         return torch.zeros(nr, nc, device=device, dtype=dtype)
 
-    dens = torch.zeros(nr, nc, device=device, dtype=dtype)
     # Peak memory for full broadcast is O(M * nr * nc); chunk macros when too large.
     max_elems = 256 * 1024 * 1024
     bin_cells = nr * nc
@@ -741,6 +996,7 @@ def _plc_macro_overlap_density_grid(
     by0_b = by0.unsqueeze(0)
     by1_b = by1.unsqueeze(0)
 
+    chunk_results: list[torch.Tensor] = []
     for start in range(0, n, chunk):
         end = min(start + chunk, n)
         cx = full_pos[start:end, 0].view(-1, 1, 1)
@@ -753,8 +1009,8 @@ def _plc_macro_overlap_density_grid(
         ty_m = cy + 0.5 * h
         ix0 = torch.relu(torch.minimum(rx, bx1_b) - torch.maximum(lx, bx0_b))
         iy0 = torch.relu(torch.minimum(ty_m, by1_b) - torch.maximum(by_m, by0_b))
-        dens = dens + (ix0 * iy0).sum(dim=0) / bin_area
-    return dens
+        chunk_results.append((ix0 * iy0).sum(dim=0))
+    return torch.stack(chunk_results).sum(dim=0) / bin_area
 
 
 def _rudy_loss_loop(
@@ -783,7 +1039,7 @@ def _rudy_loss_loop(
     ports = benchmark.port_positions.to(device=device, dtype=dtype)
 
     demand = torch.zeros(nr, nc, device=device, dtype=dtype)
-    eps_area = torch.tensor(1e-18, device=device, dtype=dtype)
+    eps_area = torch.tensor(_RUDY_AREA_EPS, device=device, dtype=dtype)
 
     for k in range(int(benchmark.num_nets)):
         nodes = benchmark.net_nodes[k]
@@ -816,7 +1072,7 @@ def _rudy_loss_loop(
         overlap = ox * oy
         demand = demand + weights[k] * overlap / area
 
-    overflow = torch.relu(demand - 1.0)
+    overflow = _soft_capacity_excess(demand - 1.0)
     return (overflow * overflow).sum()
 
 
@@ -887,7 +1143,9 @@ def _rudy_demand_grid(
     ox = torch.relu(torch.minimum(rx_, bx1) - torch.maximum(lx_, bx0))
     oy = torch.relu(torch.minimum(ty_, by1) - torch.maximum(by_, by0))
 
-    eps = torch.tensor(1e-18, device=combined_pos.device, dtype=combined_pos.dtype)
+    eps = torch.tensor(
+        _RUDY_AREA_EPS, device=combined_pos.device, dtype=combined_pos.dtype
+    )
     area = torch.relu(rx_ - lx_) * torch.relu(ty_ - by_) + eps
 
     w = (net_weights * net_valid.to(net_weights.dtype)).view(-1, 1, 1)
@@ -919,7 +1177,7 @@ def _rudy_loss_v2(
         bin_y0,
         bin_y1,
     )
-    overflow = torch.relu(demand - 1.0)
+    overflow = _soft_capacity_excess(demand - 1.0)
     return (overflow * overflow).sum()
 
 
@@ -986,7 +1244,9 @@ def _rudy_loss_v2_chunk(
     ox = torch.relu(torch.minimum(rx_, bx1) - torch.maximum(lx_, bx0))
     oy = torch.relu(torch.minimum(ty_, by1) - torch.maximum(by_, by0))
 
-    eps = torch.tensor(1e-18, device=combined_pos.device, dtype=combined_pos.dtype)
+    eps = torch.tensor(
+        _RUDY_AREA_EPS, device=combined_pos.device, dtype=combined_pos.dtype
+    )
     area = torch.relu(rx_ - lx_) * torch.relu(ty_ - by_) + eps
 
     w = (net_weights * net_valid.to(net_weights.dtype)).view(-1, 1, 1)
@@ -1080,7 +1340,7 @@ def randomize_movable_macro_centers(benchmark: Benchmark, *, seed: int | None = 
     """Uniform random center for each non-fixed macro inside its legal canvas box.
 
     Mutates ``benchmark.macro_positions`` in place (same bounds as training clamp).
-    Call **before** ``GradientPlacer.place`` — e.g. when probing recovery from a bad
+    Call **before** a gradient placer's ``place`` — e.g. when probing recovery from a bad
     initial layout. If you use ``macro_place.evaluate.evaluate_benchmark``, load the
     benchmark, call this, then run evaluation so ``proxy_cost_initial`` matches the
     randomized state.
@@ -1105,45 +1365,46 @@ def randomize_movable_macro_centers(benchmark: Benchmark, *, seed: int | None = 
         pos[i, 1] = h + torch.rand((), device=dev, dtype=dt) * span_y
 
 
-class GradientPlacer:
+class Gradient3Placer:
     """
-    Differentiable placement (Adam + smooth losses), then optional ``QPLegalizer``.
+    Local-refinement placement: **SGD + Nesterov** (optional momentum restart), exponential
+    ``β`` schedule for LSE / softplus surrogates, tighter **top-percentile** reductions,
+    optional **narrow Gaussian** density kernels, **RUDY + pin-demand fusion** (non-PLC) on
+    a matching or finer grid, periodic **QP legalization lookahead**,
+    optional **routing-grid doubling**, surrogate/proxy correlation plot. Wirelength and RUDY
+    use ``torch.compile`` subgraphs when supported (PLC routing path is not compiled; pin
+    fusion disables RUDY compile).
 
-    Optimization uses ``float32``; QP / diagnostics use ``float64``. Device is chosen
-    heuristically so small benchmarks stay on CPU.
-
-    Stopping: ``epochs`` / optional ``max_wall_seconds``; ICCAD04 benchmarks also support
-    periodic ``compute_proxy_cost`` with ``proxy_patience``; optional flat-loss guard
-    (``loss_flat_*``). If PLC loads and ``proxy_eval_interval > 0``, the tensor returned is
-    the **best proxy** placement seen at checkpoints — not necessarily the last epoch.
-    With ``proxy_eval_interval=0``, no checkpoint proxy runs and the **final** placement is
-    returned (cheaper but long runs can look worse on proxy even if they improved earlier).
-
-    Optional ``epoch_timing_diagnostic`` path: per-epoch CSV + summary (CUDA-synchronized
-    segment times in seconds) for profiling assemble / surrogates / backward / optimizer / proxy.
-
-    Surrogate terms match PlacementCost **structure** (normalized WL, top-10% density,
-    top-5% congestion via PLC-aligned routing surrogate by default). Default coefficients match ``compute_proxy_cost``:
-    ``w_wl=1.0``, ``w_dens_hard=0.5``, ``w_cong=0.5``. Optional ``proxy_adaptive_weights``
-    perturbs only WL vs congestion weights while holding density at ``w_dens_hard``.
+    Surrogate coefficients default like ``compute_proxy_cost``: ``w_wl=1.0``, ``w_dens_hard=0.5``,
+    ``w_cong=0.5``. Returns **best proxy** placement when PLC checkpoints run
+    (``proxy_eval_interval > 0``).
     """
 
     def __init__(
         self,
         epochs: int = 10000,
-        lr: float = 0.001,
-        beta: float = 1.0,
+        lr_pos_hard: float = 0.04,
+        lr_pos_soft: float = 0.012,
+        momentum: float = 0.9,
+        nesterov: bool = True,
+        momentum_restart: bool = True,
+        beta0: float = 1.0,
+        beta_end_factor: float = 10.0,
+        sigma0: float = 1.0,
+        sigma1: float = 0.25,
+        sigma_floor: float = 0.25,
+        connectivity_density_boost: float = 0.0,
+        use_local_gaussian_density: bool = False,
+        top_frac_density: float = 0.1,
+        top_frac_cong: float = 0.05,
         seed: int = 0,
         target_hard: float = 0.7,
         target_soft: float = 0.8,
-        # Same coefficients as proxy: 1.0*WL + 0.5*density + 0.5*congestion
         w_wl: float = 1.0,
         w_dens_hard: float = 0.5,
         w_dens_soft: float = 0.0,
         w_cong: float = 0.5,
         qp_legalize: bool = False,
-        # Stopping: max epochs remains ``epochs``. Optional wall clock, proxy patience,
-        # and (secondary) flat surrogate loss after ``loss_flat_min_epoch``.
         max_wall_seconds: float | None = None,
         proxy_eval_interval: int = 50,
         proxy_patience: int = 5,
@@ -1156,12 +1417,44 @@ class GradientPlacer:
         loss_flat_min_epoch: int = 500,
         training_log_csv: str | Path | None = "logs.txt",
         training_log_plot: str | Path | None = "logs_plot.png",
+        surrogate_proxy_plot: str | Path | None = "surrogate_proxy_corr.png",
         use_plc_routing_cong: bool = True,
         epoch_timing_diagnostic: str | Path | None = None,
+        qp_lookahead_interval: int = 0,
+        grid_doubling: bool = False,
+        proxy_anchor_interval: int = 0,
+        proxy_anchor_revert_ratio: float = 1.05,
+        rudy_hotspot_net_frac: float | None = 0.12,
+        surrogate_beta_boost_on_divergence: float = 1.15,
+        surrogate_beta_boost_max: float = 25.0,
+        pin_rudy_fusion: bool = True,
+        pin_demand_sigma_um: float = 3.0,
+        pin_demand_weight: float = 0.5,
+        pin_util_threshold: float = 0.7,
+        pin_overflow_sharpness: float = 20.0,
+        pin_grid_rows: int | None = None,
+        pin_grid_cols: int | None = None,
+        pin_sigma_max_um: float = 80.0,
+        proxy_anchor_tune_pins: bool = True,
+        congestion_proxy_anchor_interval: int = 20,
     ):
         self.epochs = int(epochs)
-        self.lr = float(lr)
-        self.beta = float(beta)
+        self.lr_pos_hard = float(lr_pos_hard)
+        self.lr_pos_soft = float(lr_pos_soft)
+        self.momentum = float(momentum)
+        self.nesterov = bool(nesterov)
+        self.momentum_restart = bool(momentum_restart)
+        self.beta0 = float(beta0)
+        self.beta_end_factor = float(beta_end_factor)
+        self.sigma0 = float(sigma0)
+        self.sigma1 = float(sigma1)
+        self.sigma_floor = float(sigma_floor)
+        self.connectivity_density_boost = float(connectivity_density_boost)
+        self.use_local_gaussian_density = bool(use_local_gaussian_density)
+        tf_d = float(top_frac_density)
+        self.top_frac_density = min(max(tf_d, 1e-6), 1.0)
+        tf_c = float(top_frac_cong)
+        self.top_frac_cong = min(max(tf_c, 1e-6), 1.0)
         self.seed = int(seed)
         self.target_hard = float(target_hard)
         self.target_soft = float(target_soft)
@@ -1184,8 +1477,28 @@ class GradientPlacer:
         self.loss_flat_min_epoch = int(loss_flat_min_epoch)
         self.training_log_csv = training_log_csv
         self.training_log_plot = training_log_plot
+        self.surrogate_proxy_plot = surrogate_proxy_plot
         self.use_plc_routing_cong = bool(use_plc_routing_cong)
         self.epoch_timing_diagnostic = epoch_timing_diagnostic
+        self.qp_lookahead_interval = int(qp_lookahead_interval)
+        self.grid_doubling = bool(grid_doubling)
+        self.proxy_anchor_interval = int(proxy_anchor_interval)
+        self.proxy_anchor_revert_ratio = float(proxy_anchor_revert_ratio)
+        self.rudy_hotspot_net_frac = rudy_hotspot_net_frac
+        self.surrogate_beta_boost_on_divergence = float(
+            surrogate_beta_boost_on_divergence
+        )
+        self.surrogate_beta_boost_max = float(surrogate_beta_boost_max)
+        self.pin_rudy_fusion = bool(pin_rudy_fusion)
+        self.pin_demand_sigma_um = float(pin_demand_sigma_um)
+        self.pin_demand_weight = float(pin_demand_weight)
+        self.pin_util_threshold = float(pin_util_threshold)
+        self.pin_overflow_sharpness = float(pin_overflow_sharpness)
+        self.pin_grid_rows = pin_grid_rows
+        self.pin_grid_cols = pin_grid_cols
+        self.pin_sigma_max_um = float(pin_sigma_max_um)
+        self.proxy_anchor_tune_pins = bool(proxy_anchor_tune_pins)
+        self.congestion_proxy_anchor_interval = int(congestion_proxy_anchor_interval)
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         torch.manual_seed(self.seed)
@@ -1224,7 +1537,42 @@ class GradientPlacer:
             params.append(pos_soft)
         if not params:
             return benchmark.macro_positions.clone()
-        opt = torch.optim.Adam(params, lr=self.lr)
+
+        param_groups: list[dict] = []
+        if pos_hard.numel() > 0:
+            param_groups.append(
+                {
+                    "params": [pos_hard],
+                    "lr": self.lr_pos_hard,
+                    "momentum": self.momentum,
+                    "nesterov": self.nesterov,
+                }
+            )
+        if pos_soft.numel() > 0:
+            param_groups.append(
+                {
+                    "params": [pos_soft],
+                    "lr": self.lr_pos_soft,
+                    "momentum": self.momentum,
+                    "nesterov": self.nesterov,
+                }
+            )
+        opt = torch.optim.SGD(param_groups)
+
+        nr_base = max(int(benchmark.grid_rows), 1)
+        nc_base = max(int(benchmark.grid_cols), 1)
+        nr_sur = nr_base
+        nc_sur = nc_base
+        grid_doubled_yet = False
+        density_macro_idx = list(range(n_macros))
+
+        connectivity_row_mult = _macro_connectivity_row_mult(
+            benchmark,
+            density_macro_idx,
+            device,
+            grad_dtype,
+            self.connectivity_density_boost,
+        )
 
         w_wl_dyn = float(self.w_wl)
         w_dh_dyn = float(self.w_dens_hard)
@@ -1236,25 +1584,30 @@ class GradientPlacer:
             benchmark, device, grad_dtype
         )
         net_weights_raw = benchmark.net_weights.to(device=device, dtype=grad_dtype)
+        pin_gather = _build_pin_gather_tensors(benchmark, device, grad_dtype)
 
-        nr = max(int(benchmark.grid_rows), 1)
-        nc = max(int(benchmark.grid_cols), 1)
-        cell_w = cw / nc
-        cell_h = ch / nr
-        bin_x0 = (
-            (torch.arange(nc, device=device, dtype=grad_dtype) * cell_w)
-            .view(1, nc)
-            .expand(nr, nc)
-            .contiguous()
-        )
-        bin_x1 = bin_x0 + cell_w
-        bin_y0 = (
-            (torch.arange(nr, device=device, dtype=grad_dtype) * cell_h)
-            .view(nr, 1)
-            .expand(nr, nc)
-            .contiguous()
-        )
-        bin_y1 = bin_y0 + cell_h
+        def _rebuild_rudy_bins(
+            nrr: int, ncc: int
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            cell_w_ = cw / float(ncc)
+            cell_h_ = ch / float(nrr)
+            bx0 = (
+                (torch.arange(ncc, device=device, dtype=grad_dtype) * cell_w_)
+                .view(1, ncc)
+                .expand(nrr, ncc)
+                .contiguous()
+            )
+            bx1 = bx0 + cell_w_
+            by0 = (
+                (torch.arange(nrr, device=device, dtype=grad_dtype) * cell_h_)
+                .view(nrr, 1)
+                .expand(nrr, ncc)
+                .contiguous()
+            )
+            by1 = by0 + cell_h_
+            return bx0, bx1, by0, by1
+
+        bin_x0, bin_x1, bin_y0, bin_y1 = _rebuild_rudy_bins(nr_sur, nc_sur)
 
         assemble_ctx = _build_assemble_ctx(benchmark, device, grad_dtype)
         clamp_ctx = _build_clamp_ctx(
@@ -1277,7 +1630,7 @@ class GradientPlacer:
                         net_mask,
                         net_weights_norm,
                         net_valid,
-                        self.beta,
+                        self.beta0,
                     )
                     if not self.use_plc_routing_cong:
                         _rudy_loss_compiled(
@@ -1286,7 +1639,7 @@ class GradientPlacer:
                             net_mask,
                             net_weights_raw,
                             net_valid,
-                            self.beta,
+                            self.beta0,
                             bin_x0,
                             bin_x1,
                             bin_y0,
@@ -1298,7 +1651,7 @@ class GradientPlacer:
                             net_mask,
                             net_weights_raw,
                             net_valid,
-                            self.beta,
+                            self.beta0,
                             bin_x0,
                             bin_x1,
                             bin_y0,
@@ -1317,6 +1670,21 @@ class GradientPlacer:
             )
         else:
             _wl_fn = _wirelength_loss_v2
+            _rudy_demand_fn = _rudy_demand_grid
+
+        if (
+            not self.use_plc_routing_cong
+            and self.rudy_hotspot_net_frac is not None
+        ):
+            using_compiled = False
+            _rudy_demand_fn = _rudy_demand_grid
+
+        if (
+            not self.use_plc_routing_cong
+            and self.pin_rudy_fusion
+            and pin_gather is not None
+        ):
+            using_compiled = False
             _rudy_demand_fn = _rudy_demand_grid
 
         loss_check_done = False
@@ -1341,10 +1709,25 @@ class GradientPlacer:
         log_loss: list[float] = []
         proxy_epochs: list[int] = []
         proxy_vals: list[float] = []
+        corr_sur: list[float] = []
+        corr_px: list[float] = []
         log_fp = None
         proxy_adapt_state = _ProxyWeightAdaptState(step=self.proxy_adapt_step)
         sur_baseline: tuple[float, float, float] | None = None
         px_baseline: tuple[float, float, float] | None = None
+
+        beta_end_dynamic = 1.0
+        prev_ck_sur: float | None = None
+        prev_ck_px: float | None = None
+
+        anchor_best_proxy = float("inf")
+        anchor_pos_hard: torch.Tensor | None = None
+        anchor_pos_soft: torch.Tensor | None = None
+
+        sigma_pin_um = float(self.pin_demand_sigma_um)
+        top_frac_cong_dyn = float(self.top_frac_cong)
+        anchor_prev_proxy_tune: float | None = None
+        anchor_prev_l_cong_tune: float | None = None
 
         if log_csv_path is not None:
             log_fp = open(log_csv_path, "w", encoding="utf-8")
@@ -1411,7 +1794,7 @@ class GradientPlacer:
             )
             diag_fp.write(
                 "# t_zero_grad=opt.zero_grad; t_optimizer=opt.step only; "
-                "column names in _EPOCH_DIAG_NUMERIC_COLS (gradient.py)\n"
+                "column names in _EPOCH_DIAG_NUMERIC_COLS (gradient3.py)\n"
             )
             diag_fp.write(
                 "# all t_* are wall seconds per segment (CUDA sync per segment when enabled)\n"
@@ -1421,6 +1804,7 @@ class GradientPlacer:
 
         try:
             _sync(device)
+            congestion_px_anchor_bias = 0.0
             for epoch in range(self.epochs):
                 if diag_fp is not None:
                     epoch_diag_t0 = time.perf_counter()
@@ -1430,6 +1814,50 @@ class GradientPlacer:
                 else:
                     epoch_diag_t0 = 0.0
                     row = None
+
+                beta_eff = _sched_exponential_beta(
+                    epoch,
+                    self.epochs,
+                    self.beta0,
+                    self.beta_end_factor * beta_end_dynamic,
+                )
+                sigma_scale = max(
+                    _sched_sigma_local(
+                        epoch, self.epochs, self.sigma0, self.sigma1
+                    ),
+                    self.sigma_floor,
+                )
+                den_ctx = (
+                    _build_density_ctx(
+                        benchmark,
+                        density_macro_idx,
+                        device,
+                        grad_dtype,
+                        sigma_scale,
+                        connectivity_row_mult
+                        if self.use_local_gaussian_density
+                        else None,
+                    )
+                    if self.use_local_gaussian_density
+                    else None
+                )
+
+                if (
+                    self.grid_doubling
+                    and (not grid_doubled_yet)
+                    and self.epochs > 1
+                    and epoch == max(1, self.epochs // 2)
+                ):
+                    nr_sur = nr_base * 2
+                    nc_sur = nc_base * 2
+                    bin_x0, bin_x1, bin_y0, bin_y1 = _rebuild_rudy_bins(nr_sur, nc_sur)
+                    using_compiled = False
+                    _wl_fn = _wirelength_loss_v2
+                    _rudy_demand_fn = _rudy_demand_grid
+                    grid_doubled_yet = True
+
+                rout_nr = nr_sur if self.grid_doubling and grid_doubled_yet else None
+                rout_nc = nc_sur if self.grid_doubling and grid_doubled_yet else None
 
                 with _diag_segment(row, "t_zero_grad", device):
                     opt.zero_grad()
@@ -1446,21 +1874,21 @@ class GradientPlacer:
                             )
                             if not torch.allclose(full, full_ref, rtol=1e-5, atol=1e-6):
                                 raise AssertionError("assemble_full_fast mismatch")
-                            old_wl = _wirelength_loss_loop(full, benchmark, self.beta)
+                            old_wl = _wirelength_loss_loop(full, benchmark, beta_eff)
                             new_wl = _wirelength_loss_v2(
                                 combined_pos,
                                 net_idx,
                                 net_mask,
                                 net_weights_norm,
                                 net_valid,
-                                self.beta,
+                                beta_eff,
                             )
                             if not torch.allclose(old_wl, new_wl, rtol=1e-4, atol=1e-6):
                                 raise AssertionError(
                                     f"wirelength v2 mismatch: loop={old_wl.item()} v2={new_wl.item()}"
                                 )
                             old_r = _rudy_loss_loop(
-                                full, benchmark, self.beta, device, grad_dtype
+                                full, benchmark, beta_eff, device, grad_dtype
                             )
                             new_r = _rudy_loss_v2(
                                 combined_pos,
@@ -1468,7 +1896,7 @@ class GradientPlacer:
                                 net_mask,
                                 net_weights_raw,
                                 net_valid,
-                                self.beta,
+                                beta_eff,
                                 bin_x0,
                                 bin_x1,
                                 bin_y0,
@@ -1487,15 +1915,68 @@ class GradientPlacer:
                         net_mask,
                         net_weights_norm,
                         net_valid,
-                        self.beta,
+                        beta_eff,
                     )
                     l_wl = l_wl_raw / wl_norm
                 with _diag_segment(row, "t_overlap_grid", device):
-                    dens_grid = _plc_macro_overlap_density_grid(
-                        full, benchmark, cw, ch, nr, nc
-                    )
+                    if self.use_local_gaussian_density:
+                        dens_grid = None
+                        if den_ctx is None or den_ctx[2] is None:
+                            l_dh = torch.zeros((), device=device, dtype=grad_dtype)
+                        else:
+                            l_dh = _density_loss_fast(
+                                full,
+                                self.target_hard,
+                                den_ctx,
+                                sharpness=beta_eff,
+                            )
+                    else:
+                        dens_grid = _plc_macro_overlap_density_grid(
+                            full, benchmark, cw, ch, nr_sur, nc_sur
+                        )
                 with _diag_segment(row, "t_density_scalar", device):
-                    l_dh = _plc_style_density_from_grid(dens_grid)
+                    if not self.use_local_gaussian_density:
+                        l_dh = _plc_style_density_from_grid(
+                            dens_grid,
+                            top_frac=self.top_frac_density,
+                        )
+                dens_for_rudy_filter: torch.Tensor | None = None
+                if not self.use_local_gaussian_density:
+                    dens_for_rudy_filter = dens_grid
+                elif (
+                    not self.use_plc_routing_cong
+                    and self.rudy_hotspot_net_frac is not None
+                ):
+                    with _diag_segment(row, "t_rudy_filter_grid", device):
+                        dens_for_rudy_filter = _plc_macro_overlap_density_grid(
+                            full, benchmark, cw, ch, nr_sur, nc_sur
+                        )
+
+                net_idx_r = net_idx
+                net_mask_r = net_mask
+                net_weights_raw_r = net_weights_raw
+                net_weights_norm_r = net_weights_norm
+                net_valid_r = net_valid
+                if (
+                    not self.use_plc_routing_cong
+                    and self.rudy_hotspot_net_frac is not None
+                    and dens_for_rudy_filter is not None
+                ):
+                    am = _rudy_nets_active_mask(
+                        combined_pos,
+                        net_idx,
+                        net_mask,
+                        dens_for_rudy_filter,
+                        self.rudy_hotspot_net_frac,
+                        cw,
+                        ch,
+                    )
+                    net_idx_r = net_idx[am]
+                    net_mask_r = net_mask[am]
+                    net_weights_raw_r = net_weights_raw[am]
+                    net_weights_norm_r = net_weights_norm[am]
+                    net_valid_r = net_valid[am]
+
                 smooth_cong = int(benchmark.congestion_smooth_range)
                 if plc is not None:
                     smooth_cong = int(plc.get_congestion_smooth_range())
@@ -1510,24 +1991,77 @@ class GradientPlacer:
                             full,
                             benchmark,
                             smooth_range=smooth_cong,
+                            abu_frac=top_frac_cong_dyn,
+                            nr=rout_nr,
+                            nc=rout_nc,
                         )
                     else:
                         demand = _rudy_demand_fn(
                             combined_pos,
-                            net_idx,
-                            net_mask,
-                            net_weights_raw,
-                            net_valid,
-                            self.beta,
+                            net_idx_r,
+                            net_mask_r,
+                            net_weights_raw_r,
+                            net_valid_r,
+                            beta_eff,
                             bin_x0,
                             bin_x1,
                             bin_y0,
                             bin_y1,
                         )
-                        overflow = torch.relu(demand - 1.0)
-                        l_cong = _abu_top_mean(overflow, 0.05)
+                        if (
+                            self.pin_rudy_fusion
+                            and pin_gather is not None
+                        ):
+                            nrp = self.pin_grid_rows
+                            ncp = self.pin_grid_cols
+                            if nrp is None:
+                                nrp = nr_sur
+                            if ncp is None:
+                                ncp = nc_sur
+                            nrp = max(int(nrp), 1)
+                            ncp = max(int(ncp), 1)
+                            with _diag_segment(row, "t_pin_demand", device):
+                                pin_d = _compute_pin_demand_grid(
+                                    combined_pos,
+                                    pin_gather[0],
+                                    pin_gather[1],
+                                    nrp,
+                                    ncp,
+                                    cw,
+                                    ch,
+                                    sigma_pin_um,
+                                )
+                                if nrp != nr_sur or ncp != nc_sur:
+                                    pin_d = F.interpolate(
+                                        pin_d.unsqueeze(0).unsqueeze(0),
+                                        size=(nr_sur, nc_sur),
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    ).squeeze(0).squeeze(0)
+                            l_cong = _refinement_rudy_pin_cong_loss(
+                                demand,
+                                pin_d,
+                                pin_weight=self.pin_demand_weight,
+                                util_threshold=self.pin_util_threshold,
+                                overflow_sharpness=self.pin_overflow_sharpness,
+                                top_k_frac=top_frac_cong_dyn,
+                            )
+                        else:
+                            overflow = _soft_capacity_excess(
+                                demand - 1.0, sharpness=beta_eff
+                            )
+                            l_cong = _abu_top_mean(
+                                overflow, top_frac_cong_dyn
+                            )
     
-                if epoch == 0 and using_compiled and not self.use_plc_routing_cong:
+                if (
+                    epoch == 0
+                    and using_compiled
+                    and not self.use_plc_routing_cong
+                    and not (
+                        self.pin_rudy_fusion and pin_gather is not None
+                    )
+                ):
                     with _diag_segment(row, "t_epoch0_compile_check", device):
                         l_wl_ref = _wirelength_loss_v2(
                             combined_pos,
@@ -1535,7 +2069,7 @@ class GradientPlacer:
                             net_mask,
                             net_weights_norm,
                             net_valid,
-                            self.beta,
+                            beta_eff,
                         )
                         rel_wl = abs(l_wl_raw.item() - l_wl_ref.item()) / (
                             abs(l_wl_ref.item()) + 1e-8
@@ -1545,11 +2079,11 @@ class GradientPlacer:
                         )
                         demand_ref = _rudy_demand_grid(
                             combined_pos,
-                            net_idx,
-                            net_mask,
-                            net_weights_raw,
-                            net_valid,
-                            self.beta,
+                            net_idx_r,
+                            net_mask_r,
+                            net_weights_raw_r,
+                            net_valid_r,
+                            beta_eff,
                             bin_x0,
                             bin_x1,
                             bin_y0,
@@ -1582,17 +2116,116 @@ class GradientPlacer:
                 wdh_u = w_dh_dyn
                 wds_u = w_ds_dyn
                 wc_u = w_c_dyn
+                l_cong_for_loss = l_cong
+                if self.congestion_proxy_anchor_interval > 0:
+                    l_cong_for_loss = l_cong + congestion_px_anchor_bias
                 with _diag_segment(row, "t_loss_scalar", device):
-                    loss = wl_u * l_wl + wdh_u * l_dh + wc_u * l_cong
+                    loss = (
+                        wl_u * l_wl + wdh_u * l_dh + wc_u * l_cong_for_loss
+                    )
                     lv = float(loss.item())
                 with _diag_segment(row, "t_backward", device):
                     loss.backward()
                 with _diag_segment(row, "t_optimizer", device):
+                    if self.momentum_restart:
+                        _nesterov_momentum_restart(opt)
                     opt.step()
 
                 with _diag_segment(row, "t_clamp", device):
                     _clamp_movable_fast(pos_hard, pos_soft, clamp_ctx)
-    
+
+                if (
+                    self.qp_lookahead_interval > 0
+                    and plc is not None
+                    and n_hard > 0
+                    and movable_hard_idx
+                    and epoch > 0
+                    and epoch % self.qp_lookahead_interval == 0
+                ):
+                    pv_la = float("inf")
+                    legal_la: torch.Tensor | None = None
+                    with _diag_segment(row, "t_qp_lookahead", device):
+                        with torch.no_grad():
+                            full_la = _assemble_full_fast(
+                                pos_hard, pos_soft, assemble_ctx
+                            )
+                            full_cpu_la = full_la.detach().cpu().to(qp_dtype)
+                            saved_bp = benchmark.macro_positions.clone()
+                            try:
+                                benchmark.macro_positions.copy_(full_cpu_la.float())
+                                legal_la = QPLegalizer().place(benchmark)
+                                c_la = compute_proxy_cost(legal_la, benchmark, plc)
+                                pv_la = float(c_la["proxy_cost"])
+                            finally:
+                                benchmark.macro_positions.copy_(saved_bp)
+                    if legal_la is not None and pv_la < best_proxy_val:
+                        best_proxy_val = pv_la
+                        best_proxy_placement = legal_la.clone()
+                        _scatter_legal_placement_into_params(
+                            legal_la,
+                            pos_hard,
+                            pos_soft,
+                            movable_hard_idx,
+                            n_hard,
+                            n_macros,
+                            device,
+                            grad_dtype,
+                        )
+                        _zero_sgd_momentum(opt)
+
+                if (
+                    self.proxy_anchor_interval > 0
+                    and plc is not None
+                    and epoch > 0
+                    and epoch % self.proxy_anchor_interval == 0
+                ):
+                    with torch.no_grad():
+                        full_an = _assemble_full_fast(
+                            pos_hard, pos_soft, assemble_ctx
+                        )
+                        full_cpu_an = full_an.detach().cpu().to(qp_dtype)
+                        c_an = compute_proxy_cost(full_cpu_an, benchmark, plc)
+                        pv_an = float(c_an["proxy_cost"])
+                    if pv_an < anchor_best_proxy:
+                        anchor_best_proxy = pv_an
+                        if pos_hard.numel() > 0:
+                            anchor_pos_hard = pos_hard.detach().clone()
+                        if pos_soft.numel() > 0:
+                            anchor_pos_soft = pos_soft.detach().clone()
+                    elif (
+                        anchor_best_proxy < float("inf")
+                        and pv_an
+                        > anchor_best_proxy * self.proxy_anchor_revert_ratio
+                    ):
+                        if pos_hard.numel() > 0 and anchor_pos_hard is not None:
+                            pos_hard.data.copy_(anchor_pos_hard)
+                        if pos_soft.numel() > 0 and anchor_pos_soft is not None:
+                            pos_soft.data.copy_(anchor_pos_soft)
+                        opt.zero_grad()
+                        _zero_sgd_momentum(opt)
+                    if (
+                        self.proxy_anchor_tune_pins
+                        and self.pin_rudy_fusion
+                        and pin_gather is not None
+                    ):
+                        if (
+                            anchor_prev_proxy_tune is not None
+                            and anchor_prev_l_cong_tune is not None
+                        ):
+                            if (
+                                pv_an > anchor_prev_proxy_tune * 1.05
+                                and lcong_f < anchor_prev_l_cong_tune * 0.99
+                            ):
+                                sigma_pin_um = min(
+                                    sigma_pin_um * 1.08,
+                                    self.pin_sigma_max_um,
+                                )
+                                top_frac_cong_dyn = max(
+                                    top_frac_cong_dyn * 0.92, 0.01
+                                )
+                        anchor_prev_proxy_tune = pv_an
+                        anchor_prev_l_cong_tune = lcong_f
+
                 loss_val = lv
                 if loss_hist is not None:
                     loss_hist.append(loss_val)
@@ -1617,13 +2250,29 @@ class GradientPlacer:
                                 net_mask,
                                 net_weights_norm,
                                 net_valid,
-                                self.beta,
+                                beta_eff,
                             )
                             l_wl_ev = l_wl_raw_ev / wl_norm
-                            dens_grid_ev = _plc_macro_overlap_density_grid(
-                                full_ev, benchmark, cw, ch, nr, nc
-                            )
-                            l_dh_ev = _plc_style_density_from_grid(dens_grid_ev)
+                            if self.use_local_gaussian_density:
+                                if den_ctx is None or den_ctx[2] is None:
+                                    l_dh_ev = torch.zeros(
+                                        (), device=device, dtype=grad_dtype
+                                    )
+                                else:
+                                    l_dh_ev = _density_loss_fast(
+                                        full_ev,
+                                        self.target_hard,
+                                        den_ctx,
+                                        sharpness=beta_eff,
+                                    )
+                            else:
+                                dens_grid_ev = _plc_macro_overlap_density_grid(
+                                    full_ev, benchmark, cw, ch, nr_sur, nc_sur
+                                )
+                                l_dh_ev = _plc_style_density_from_grid(
+                                    dens_grid_ev,
+                                    top_frac=self.top_frac_density,
+                                )
                             smooth_ev = int(benchmark.congestion_smooth_range)
                             if plc is not None:
                                 smooth_ev = int(plc.get_congestion_smooth_range())
@@ -1637,30 +2286,147 @@ class GradientPlacer:
                                     full_ev,
                                     benchmark,
                                     smooth_range=smooth_ev,
+                                    abu_frac=top_frac_cong_dyn,
+                                    nr=rout_nr,
+                                    nc=rout_nc,
                                 )
                             else:
+                                dens_fe: torch.Tensor | None = None
+                                if not self.use_local_gaussian_density:
+                                    dens_fe = dens_grid_ev
+                                elif (
+                                    self.rudy_hotspot_net_frac is not None
+                                ):
+                                    dens_fe = _plc_macro_overlap_density_grid(
+                                        full_ev,
+                                        benchmark,
+                                        cw,
+                                        ch,
+                                        nr_sur,
+                                        nc_sur,
+                                    )
+                                nix = net_idx
+                                nmk = net_mask
+                                nwr = net_weights_raw
+                                nvl = net_valid
+                                if (
+                                    self.rudy_hotspot_net_frac is not None
+                                    and dens_fe is not None
+                                ):
+                                    am_ev = _rudy_nets_active_mask(
+                                        combined_ev,
+                                        net_idx,
+                                        net_mask,
+                                        dens_fe,
+                                        self.rudy_hotspot_net_frac,
+                                        cw,
+                                        ch,
+                                    )
+                                    nix = net_idx[am_ev]
+                                    nmk = net_mask[am_ev]
+                                    nwr = net_weights_raw[am_ev]
+                                    nvl = net_valid[am_ev]
                                 demand_ev = _rudy_demand_fn(
                                     combined_ev,
-                                    net_idx,
-                                    net_mask,
-                                    net_weights_raw,
-                                    net_valid,
-                                    self.beta,
+                                    nix,
+                                    nmk,
+                                    nwr,
+                                    nvl,
+                                    beta_eff,
                                     bin_x0,
                                     bin_x1,
                                     bin_y0,
                                     bin_y1,
                                 )
-                                overflow_ev = torch.relu(demand_ev - 1.0)
-                                l_cong_ev = _abu_top_mean(overflow_ev, 0.05)
+                                if (
+                                    self.pin_rudy_fusion
+                                    and pin_gather is not None
+                                ):
+                                    nrp = self.pin_grid_rows
+                                    ncp = self.pin_grid_cols
+                                    if nrp is None:
+                                        nrp = nr_sur
+                                    if ncp is None:
+                                        ncp = nc_sur
+                                    nrp = max(int(nrp), 1)
+                                    ncp = max(int(ncp), 1)
+                                    pin_de = _compute_pin_demand_grid(
+                                        combined_ev,
+                                        pin_gather[0],
+                                        pin_gather[1],
+                                        nrp,
+                                        ncp,
+                                        cw,
+                                        ch,
+                                        sigma_pin_um,
+                                    )
+                                    if nrp != nr_sur or ncp != nc_sur:
+                                        pin_de = F.interpolate(
+                                            pin_de.unsqueeze(0).unsqueeze(0),
+                                            size=(nr_sur, nc_sur),
+                                            mode="bilinear",
+                                            align_corners=False,
+                                        ).squeeze(0).squeeze(0)
+                                    l_cong_ev = _refinement_rudy_pin_cong_loss(
+                                        demand_ev,
+                                        pin_de,
+                                        pin_weight=self.pin_demand_weight,
+                                        util_threshold=self.pin_util_threshold,
+                                        overflow_sharpness=self.pin_overflow_sharpness,
+                                        top_k_frac=top_frac_cong_dyn,
+                                    )
+                                else:
+                                    overflow_ev = _soft_capacity_excess(
+                                        demand_ev - 1.0,
+                                        sharpness=beta_eff,
+                                    )
+                                    l_cong_ev = _abu_top_mean(
+                                        overflow_ev,
+                                        top_frac_cong_dyn,
+                                    )
                             sw = float(l_wl_ev.item())
                             sdh = float(l_dh_ev.item())
                             sc = float(l_cong_ev.item())
                             costs = compute_proxy_cost(full_cpu_ev, benchmark, plc)
-                        pv = float(costs["proxy_cost"])
-                        pw = float(costs["wirelength_cost"])
-                        pd = float(costs["density_cost"])
-                        pc = float(costs["congestion_cost"])
+                            pv = float(costs["proxy_cost"])
+                            pw = float(costs["wirelength_cost"])
+                            pd = float(costs["density_cost"])
+                            pc = float(costs["congestion_cost"])
+                            if (
+                                self.congestion_proxy_anchor_interval > 0
+                                and (epoch + 1)
+                                % self.congestion_proxy_anchor_interval
+                                == 0
+                            ):
+                                congestion_px_anchor_bias = float(pc - sc)
+                                _cpa = (
+                                    f"[congestion_proxy_anchor] epoch={epoch} "
+                                    f"bias=px_raw_cong-sur_raw_cong={congestion_px_anchor_bias:.6g}"
+                                )
+                                print(_cpa, flush=True)
+                                if log_fp is not None:
+                                    log_fp.write(_cpa + "\n")
+                                    log_fp.flush()
+                            corr_sur.append(
+                                w_wl_dyn * sw + w_dh_dyn * sdh + w_c_dyn * sc
+                            )
+                            corr_px.append(pv)
+                            sur_now = (
+                                w_wl_dyn * sw + w_dh_dyn * sdh + w_c_dyn * sc
+                            )
+                            if prev_ck_sur is not None and prev_ck_px is not None:
+                                ds = (sur_now - prev_ck_sur) / (
+                                    abs(prev_ck_sur) + 1e-30
+                                )
+                                dp = (pv - prev_ck_px) / (abs(prev_ck_px) + 1e-30)
+                                if ds < -0.10 and dp > 0.05:
+                                    beta_end_dynamic = min(
+                                        beta_end_dynamic
+                                        * self.surrogate_beta_boost_on_divergence,
+                                        self.surrogate_beta_boost_max,
+                                    )
+                            prev_ck_sur = sur_now
+                            prev_ck_px = pv
                         if sur_baseline is not None and px_baseline is not None:
                             eps = 1e-30
                             n_sw = sw / max(sur_baseline[0], eps)
@@ -1808,6 +2574,10 @@ class GradientPlacer:
                 proxy_vals,
             )
 
+        corr_plot_path = _resolve_user_path(self.surrogate_proxy_plot)
+        if corr_plot_path is not None and len(corr_sur) >= 2:
+            _write_surrogate_proxy_corr_plot(corr_plot_path, corr_sur, corr_px)
+
         full_final = _assemble_full_fast(pos_hard, pos_soft, assemble_ctx)
         if best_proxy_placement is not None:
             optimized_cpu = best_proxy_placement
@@ -1833,7 +2603,7 @@ def _cli_main() -> None:
     root = _repo_root()
     case = root / "external" / "MacroPlacement" / "Testcases" / "ICCAD04" / "ibm01"
     b, _ = load_benchmark_from_dir(str(case))
-    GradientPlacer().place(b)
+    Gradient3Placer().place(b)
 
 
 if __name__ == "__main__":
