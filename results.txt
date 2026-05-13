@@ -1,0 +1,70 @@
+# Benchmark run log (annotated)
+
+## place_explore.py — ibm01 — strong proxy vs initial (2026-05-10)
+
+Source: evaluate harness output after full pipeline (3 outer GPU+explore cycles
+by default, final GPU, Abbacus legalization).
+
+Annotated excerpt:
+
+  [place_explore] final GPU phase done proxy=0.834252
+  [place_explore] Abbacus legalization done proxy=0.837807
+  [place_explore] overlapping hard-macro pairs: 0
+  proxy=0.8378  initial=1.0385  delta=-19.33%  (wl=0.079 den=0.450 cong=1.069)  VALID  [3115.86s]
+
+Notes:
+  - Final PLC proxy ~0.838 vs initial ~1.04 (~19% relative improvement; lower is better).
+  - Sub-costs at report: WL=0.079, density=0.450, congestion=1.069.
+  - Abbacus adds a small proxy bump vs pre-legalization GPU (0.834 → 0.838) but
+    clears hard-hard overlaps (pair count 0 per compute_overlap_metrics).
+  - Wall time ~52 minutes for this run (VALID placement in harness).
+
+---
+
+## place_explore.py — ibm02 — modest proxy gain (annotated)
+
+Source: same pipeline as ibm01 (`uv run evaluate submissions/place_explore.py -b ibm02`;
+defaults: outer GPU+explore cycles, final GPU, Abbacus).
+
+Annotated excerpt:
+
+  [place_explore] overlapping hard-macro pairs: 0
+  proxy=1.5101  initial=1.5658  delta=-3.56%  (wl=0.092 den=0.500 cong=2.337)  VALID  [3277.47s]
+
+Notes:
+  - Harness proxy ~1.51 vs initial ~1.57 (~3.6% relative improvement; lower is better).
+  - Sub-costs at report: WL=0.092, density=0.500, congestion=2.337 (cong dominates vs ibm01).
+  - 0 hard-hard overlap pairs after pipeline (per compute_overlap_metrics).
+  - Wall time ~55 minutes (VALID).
+
+---
+
+## timed_place_explore.py — ibm03 — evaluate summary (annotated)
+
+Source: `uv run evaluate submissions/timed_place_explore.py -b ibm03` (adaptive time
+budget enabled by default; full pipeline through Abbacus).
+
+Annotated harness line:
+
+  proxy=1.1940  initial=1.3255  delta=-9.92%  (wl=0.097 den=0.500 cong=1.693)  VALID  [1780.81s]
+
+Notes:
+  - Proxy ~1.194 vs initial ~1.326 (~10% relative improvement; lower is better).
+  - Sub-costs: WL=0.097, density=0.500, congestion=1.693.
+  - VALID in harness; wall clock ~29.7 minutes (~1781 s).
+
+---
+
+## place_explore.py — ibm04 — evaluate summary (annotated)
+
+Source: `uv run evaluate submissions/place_explore.py -b ibm04` (defaults: 3 outer
+GPU+explore cycles, final GPU, Abbacus legalization).
+
+Annotated harness line (terminal `2.txt`):
+
+  proxy=1.1810  initial=1.3133  delta=-10.07%  (wl=0.090 den=0.488 cong=1.694)  VALID  [3747.13s]
+
+Notes:
+  - Proxy ~1.181 vs initial ~1.313 (~10.1% relative improvement; lower is better).
+  - Sub-costs at report: WL=0.090, density=0.488, congestion=1.694.
+  - Wall time ~62.5 minutes (~3747 s); VALID placement in harness.

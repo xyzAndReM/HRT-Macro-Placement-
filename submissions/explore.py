@@ -1,17 +1,17 @@
 """
-Random local exploration on a coarse **8×8** canvas grid (64 cells).
+Random local exploration on a coarse grid (``grid_side ** 2`` cells).
 
-Each **epoch**:
-  1. Pick a **movable** macro uniformly at random.
-  2. Map its center to a coarse cell; consider the **3×3** block of cell centers
-     around that cell (up to **nine** targets; fewer on boundaries).
-  3. For each in-bounds target, ``FastProxyEvaluator`` (PLC-aligned fast cost) picks
-     the best trial.
-  4. If the best trial **strictly lowers** that score vs the start of the epoch,
-     apply that move; otherwise leave the placement unchanged.
+Each **epoch**: pick a **non-fixed** macro (hard or soft), try up to nine neighboring **cell
+centers**; accept the best if it strictly lowers ``FastProxyEvaluator.total``. Only
+targets passing ``_legal_center`` (macro bbox fully inside the canvas) are tried.
 
-Every ``proxy_log_interval`` epochs, when ICCAD04 ``PlacementCost`` collateral exists,
-prints **real** ``compute_proxy_cost`` alongside the fast score for tracking.
+Non-fixed macro centers are **clamped** to the canvas before the loop and again
+before return (via ``finalize_explore_placement``) so downstream GPU phases never
+receive OOB or non-finite coordinates. ``ExploreMultiplePlacer`` replays move logs
+with the same finalizer so parent and worker layouts stay consistent.
+
+At the end, prints one summary with fast_proxy change and (when PlacementCost exists)
+real proxy before/after.
 
 Writes ``vis/<benchmark>_explore.png``: initial vs final placement (moved macros
 highlighted).
@@ -156,12 +156,12 @@ def _save_explore_figure(
 
     proxy_line = ""
     if proxy_before is not None and proxy_after is not None:
-        proxy_line = f"Real proxy {proxy_before:.6f} → {proxy_after:.6f}  |  "
+        proxy_line = f"Real proxy {proxy_before:.6f} -> {proxy_after:.6f}  |  "
     ax.set_title(
         f"{benchmark.name} — ExplorePlacer ({len(moved)} macros moved)\n"
         f"{proxy_line}"
-        f"Fast cost {fast_before:.6f} → {fast_after:.6f}  |  "
-        f"{gn}×{gn} search grid  |  {epochs} epochs, {accepted} accepted moves"
+        f"Fast cost {fast_before:.6f} -> {fast_after:.6f}  |  "
+        f"{gn}x{gn} search grid  |  {epochs} epochs, {accepted} accepted moves"
     )
 
     fig.tight_layout()
@@ -197,6 +197,81 @@ def _legal_center(
     )
 
 
+def _clamp_nonfixed_macro_centers_inplace(
+    placement: torch.Tensor,
+    benchmark: Benchmark,
+    cw: float,
+    ch: float,
+) -> None:
+    """Clamp every non-fixed macro center so its axis-aligned box stays in the canvas.
+
+    Matches ``gradient._clamp_movable`` half-extent bounds. If a macro is wider/taller
+    than the canvas, the center is pinned to the canvas midpoint on that axis.
+    """
+    n = int(benchmark.num_macros)
+    fixed = benchmark.macro_fixed
+    sizes = benchmark.macro_sizes
+    for i in range(n):
+        if bool(fixed[i].item()):
+            continue
+        w = float(sizes[i, 0].item()) * 0.5
+        h = float(sizes[i, 1].item()) * 0.5
+        if w <= 0.0 or h <= 0.0:
+            continue
+        lo_x, hi_x = w, cw - w
+        lo_y, hi_y = h, ch - h
+        x = placement[i, 0]
+        y = placement[i, 1]
+        if lo_x > hi_x:
+            x.fill_(0.5 * cw)
+        else:
+            x.clamp_(lo_x, hi_x)
+        if lo_y > hi_y:
+            y.fill_(0.5 * ch)
+        else:
+            y.clamp_(lo_y, hi_y)
+
+
+def finalize_explore_placement(
+    placement: torch.Tensor,
+    benchmark: Benchmark,
+    *,
+    fallback: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Make an explore output safe for downstream GPU / PLC: in-bounds, finite, fixed macros restored.
+
+    If canvas / finiteness checks still fail and ``fallback`` is given, return ``fallback`` unchanged
+    (explore is treated as a no-op for that candidate).
+    """
+    from macro_place.utils import validate_placement
+
+    ref = fallback if fallback is not None else benchmark.macro_positions
+    out = placement.detach().clone().to(
+        device=benchmark.macro_positions.device,
+        dtype=benchmark.macro_positions.dtype,
+    )
+    cw = float(benchmark.canvas_width)
+    ch = float(benchmark.canvas_height)
+    _clamp_nonfixed_macro_centers_inplace(out, benchmark, cw, ch)
+
+    fixed = benchmark.macro_fixed
+    out[fixed] = benchmark.macro_positions[fixed]
+
+    if not torch.isfinite(out).all():
+        bad = ~torch.isfinite(out).all(dim=1)
+        for i in range(int(out.shape[0])):
+            if bool(bad[i].item()) and not bool(fixed[i].item()):
+                out[i] = ref[i]
+
+    ok, _ = validate_placement(out, benchmark, check_overlaps=False)
+    if not ok and fallback is not None:
+        return fallback.detach().clone().to(
+            device=benchmark.macro_positions.device,
+            dtype=benchmark.macro_positions.dtype,
+        )
+    return out
+
+
 def _nine_neighbor_cells(r0: int, c0: int, n: int) -> list[tuple[int, int]]:
     """3×3 neighborhood (Chebyshev distance ≤ 1), clipped to the grid."""
     out: list[tuple[int, int]] = []
@@ -208,6 +283,31 @@ def _nine_neighbor_cells(r0: int, c0: int, n: int) -> list[tuple[int, int]]:
     return out
 
 
+def _precompute_nine_neighbors(n: int) -> list[list[list[tuple[int, int]]]]:
+    """``neighbors[r][c]`` = same list as ``_nine_neighbor_cells(r, c, n)``."""
+    return [[_nine_neighbor_cells(r, c, n) for c in range(n)] for r in range(n)]
+
+
+def _movable_macro_indices(
+    benchmark: Benchmark,
+    *,
+    hard_only: bool = False,
+    soft_only: bool = False,
+) -> list[int]:
+    """Non-fixed macro indices; optional restriction to hard or soft macro ranges."""
+    if hard_only and soft_only:
+        raise ValueError("hard_only and soft_only are mutually exclusive")
+    n_hard = int(benchmark.num_hard_macros)
+    n_macros = int(benchmark.num_macros)
+    if hard_only:
+        lo, hi = 0, n_hard
+    elif soft_only:
+        lo, hi = n_hard, n_macros
+    else:
+        lo, hi = 0, n_macros
+    return [i for i in range(lo, hi) if not bool(benchmark.macro_fixed[i].item())]
+
+
 class ExplorePlacer:
     """
     Random single-macro moves toward one of nine coarse cell centers per epoch.
@@ -216,6 +316,15 @@ class ExplorePlacer:
         grid_side: Cells per axis; total regions = ``grid_side ** 2`` (default 8 → 64).
         epochs: Number of random macro trials.
         seed: RNG seed for macro selection.
+        moved_macro_weight: After a macro has been moved once, its selection weight
+            becomes this value (default ``1.0`` = uniform). Used by ``ExploreMultiplePlacer``.
+        fast_proxy_device: Optional ``torch.device`` for ``FastProxyEvaluator`` (e.g. ``\"cpu\"``).
+        hard_macros_only: If ``True``, only non-fixed **hard** macros are candidates.
+        soft_macros_only: If ``True``, only non-fixed **soft** macros are candidates.
+            Mutually exclusive with ``hard_macros_only``.
+
+    ``place(..., quiet=True)`` skips epoch summaries and real_proxy lines (used by
+    ``ExploreMultiplePlacer`` worker processes).
     """
 
     def __init__(
@@ -223,33 +332,71 @@ class ExplorePlacer:
         grid_side: int = _GRID_SIDE,
         epochs: int = 2_500,
         seed: int = 0,
-        proxy_log_interval: int = 20,
+        moved_macro_weight: float = 1.0,
+        fast_proxy_device: torch.device | str | None = None,
+        hard_macros_only: bool = False,
+        soft_macros_only: bool = False,
     ):
         self.grid_side = int(grid_side)
         self.epochs = int(epochs)
         self.seed = int(seed)
-        self.proxy_log_interval = max(1, int(proxy_log_interval))
+        self.moved_macro_weight = float(moved_macro_weight)
+        self.fast_proxy_device = fast_proxy_device
+        self.hard_macros_only = bool(hard_macros_only)
+        self.soft_macros_only = bool(soft_macros_only)
+        if self.hard_macros_only and self.soft_macros_only:
+            raise ValueError("hard_macros_only and soft_macros_only are mutually exclusive")
 
-    def place(self, benchmark: Benchmark) -> torch.Tensor:
-        placement_start = benchmark.macro_positions.clone()
-        placement = placement_start.clone()
-        score = FastProxyEvaluator(benchmark)
+    def place(
+        self,
+        benchmark: Benchmark,
+        *,
+        initial_macro_positions: torch.Tensor | None = None,
+        save_figure: bool = True,
+        accepted_moves: list[tuple[int, float, float]] | None = None,
+        quiet: bool = False,
+    ) -> torch.Tensor:
+        if initial_macro_positions is not None:
+            placement = initial_macro_positions.detach().clone().to(
+                device=benchmark.macro_positions.device,
+                dtype=benchmark.macro_positions.dtype,
+            )
+        else:
+            placement = benchmark.macro_positions.clone()
+
+        cw = float(benchmark.canvas_width)
+        ch = float(benchmark.canvas_height)
+        placement = finalize_explore_placement(placement, benchmark, fallback=placement)
+        placement_start = placement.clone()
+
+        dev = None if self.fast_proxy_device is None else torch.device(self.fast_proxy_device)
+        score = FastProxyEvaluator(benchmark, device=dev)
+
         plc = _try_load_plc(benchmark)
-        if plc is None:
+        if plc is None and not quiet:
             print(
                 "ExplorePlacer: no ICCAD04 PlacementCost for this benchmark; "
                 "skipping periodic real_proxy logs (fast cost only)."
             )
 
-        cw = float(benchmark.canvas_width)
-        ch = float(benchmark.canvas_height)
         n = self.grid_side
         rng = random.Random(self.seed)
 
-        movable = (~benchmark.macro_fixed).nonzero(as_tuple=False).flatten().tolist()
+        movable = _movable_macro_indices(
+            benchmark,
+            hard_only=self.hard_macros_only,
+            soft_only=self.soft_macros_only,
+        )
         if not movable:
-            print("ExplorePlacer: no movable macros; placement unchanged.")
+            if not quiet:
+                print("ExplorePlacer: no movable macros; placement unchanged.")
             return placement
+
+        moved_w = float(self.moved_macro_weight)
+        if not (0.0 < moved_w <= 1.0):
+            raise ValueError("moved_macro_weight must be in (0, 1].")
+        moved_flags = {i: False for i in movable}
+        weights = [1.0 for _ in movable]
 
         sur0 = score.total(placement)
         accepted = 0
@@ -258,18 +405,9 @@ class ExplorePlacer:
             proxy_start = float(
                 compute_proxy_cost(placement.clone(), benchmark, plc)["proxy_cost"]
             )
-            print(
-                f"ExplorePlacer: epoch 0  real_proxy {proxy_start:.6f}  fast_proxy {sur0:.6f}"
-            )
 
         for ep in range(self.epochs):
-            if plc is not None and ep > 0 and ep % self.proxy_log_interval == 0:
-                px = float(compute_proxy_cost(placement.clone(), benchmark, plc)["proxy_cost"])
-                sx = score.total(placement)
-                print(
-                    f"ExplorePlacer: epoch {ep}  real_proxy {px:.6f}  fast_proxy {sx:.6f}"
-                )
-            i_macro = rng.choice(movable)
+            i_macro = rng.choices(movable, weights=weights, k=1)[0]
             w = float(benchmark.macro_sizes[i_macro, 0])
             h = float(benchmark.macro_sizes[i_macro, 1])
             x0 = float(placement[i_macro, 0])
@@ -294,47 +432,57 @@ class ExplorePlacer:
                     best_trial_p = p
                     best_trial = trial.clone()
 
-            if best_trial_p < base_cost - 1e-12:
+            if best_trial_p < base_cost - 1e-12 and torch.isfinite(best_trial).all():
                 placement = best_trial
                 accepted += 1
-                print(
-                    f"ExplorePlacer: epoch {ep}  macro {i_macro}  "
-                    f"fast_proxy {base_cost:.6f} → {best_trial_p:.6f}  "
-                    f"(Δ {best_trial_p - base_cost:+.6f})"
-                )
+                if accepted_moves is not None:
+                    accepted_moves.append(
+                        (int(i_macro), float(placement[i_macro, 0]), float(placement[i_macro, 1]))
+                    )
+                if not moved_flags[i_macro]:
+                    moved_flags[i_macro] = True
+                    for j, m in enumerate(movable):
+                        if moved_flags[m]:
+                            weights[j] = moved_w
+
+        placement = finalize_explore_placement(placement, benchmark, fallback=placement_start)
 
         sur_end = score.total(placement)
         delta_pct = (sur_end - sur0) / max(abs(sur0), 1e-30) * 100.0
-        print(
-            f"ExplorePlacer: {self.epochs} epochs, grid {n}×{n} ({n * n} cells), "
-            f"accepted {accepted} improving moves; "
-            f"fast_proxy {sur0:.6f} → {sur_end:.6f} ({delta_pct:+.3f}%)."
-        )
+        if not quiet:
+            print(
+                f"ExplorePlacer: {self.epochs} epochs, grid {n}x{n} ({n * n} cells), "
+                f"accepted {accepted} improving moves; "
+                f"fast_proxy {sur0:.6f} -> {sur_end:.6f} ({delta_pct:+.3f}%)."
+            )
 
         proxy_end = None
         if plc is not None:
             proxy_end = float(compute_proxy_cost(placement.clone(), benchmark, plc)["proxy_cost"])
             assert proxy_start is not None
             dpx = (proxy_end - proxy_start) / max(abs(proxy_start), 1e-30) * 100.0
-            print(
-                f"ExplorePlacer: real_proxy {proxy_start:.6f} → {proxy_end:.6f} ({dpx:+.3f}%)."
-            )
+            if not quiet:
+                print(
+                    f"ExplorePlacer: real_proxy {proxy_start:.6f} -> {proxy_end:.6f} ({dpx:+.3f}%)."
+                )
 
-        out_vis = _repo_root() / "vis" / f"{benchmark.name}_explore.png"
-        _save_explore_figure(
-            benchmark,
-            placement_start,
-            placement,
-            grid_side=n,
-            epochs=self.epochs,
-            accepted=accepted,
-            proxy_before=proxy_start,
-            proxy_after=proxy_end,
-            fast_before=sur0,
-            fast_after=sur_end,
-            out_path=out_vis,
-        )
-        print(f"ExplorePlacer: figure saved to {out_vis.resolve()}")
+        if save_figure:
+            out_vis = _repo_root() / "vis" / f"{benchmark.name}_explore.png"
+            _save_explore_figure(
+                benchmark,
+                placement_start,
+                placement,
+                grid_side=n,
+                epochs=self.epochs,
+                accepted=accepted,
+                proxy_before=proxy_start,
+                proxy_after=proxy_end,
+                fast_before=sur0,
+                fast_after=sur_end,
+                out_path=out_vis,
+            )
+            if not quiet:
+                print(f"ExplorePlacer: figure saved to {out_vis.resolve()}")
 
         return placement
 

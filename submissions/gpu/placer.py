@@ -1,0 +1,1183 @@
+"""
+GPU Placer (DreamPlace-inspired, legality-agnostic).
+
+Goal: run the entire optimization loop on GPU (when available) and optimize a
+smooth surrogate objective. This placer does **not** attempt to legalize or
+remove overlaps; it relies on a soft density penalty (optional) and box clamps.
+
+Usage:
+    uv run evaluate submissions/gpu/placer.py -b ibm01
+    MACRO_PLACE_DEVICE=cuda uv run evaluate submissions/gpu/placer.py -b ibm01
+
+Training curves under ``vis/``:
+
+- ``<benchmark>_gpu_proxy_vs_epoch.png`` — PLC ``proxy_cost`` (needs ICCAD04 ``PlacementCost``),
+  sampled every ``MACRO_PLACE_GPU_PROXY_CHECK_EVERY`` (default 100).
+- ``<benchmark>_gpu_surrogate_loss_vs_epoch.png`` — surrogate total loss at ``log_every``
+  (default 50), saved whenever those samples exist (in addition to the proxy curve when PLC loads).
+
+Set ``MACRO_PLACE_GPU_TRAINING_PLOT=0`` to skip all figures.
+
+Optimizer (movable macro positions):
+    ``MACRO_PLACE_GPU_OPTIMIZER`` — ``adam`` (default) for ``torch.optim.Adam``, or
+    ``nesterov`` for ``torch.optim.SGD(..., nesterov=True)``. With Nesterov,
+    ``MACRO_PLACE_GPU_MOMENTUM`` defaults to ``0.9``.
+
+PLC proxy early-stop (when ``PlacementCost`` loads):
+    ``MACRO_PLACE_GPU_STAGNATION_MIN_ABS_IMPROVEMENT`` — if **> 0** (default ``0.01``),
+    after each PLC proxy check (every ``MACRO_PLACE_GPU_PROXY_CHECK_EVERY`` epochs,
+    default ``100``), stop if the global-best proxy did not improve by at least this
+    **absolute** amount since the previous check. When **<= 0**, falls back to
+    ``MACRO_PLACE_GPU_STAGNATION_PATIENCE`` / ``MACRO_PLACE_GPU_STAGNATION_REL_DELTA``
+    if patience **> 0``.     ``MACRO_PLACE_PE_STAGNATION_MIN_ABS_IMPROVEMENT`` overrides
+    the GPU env when set (same semantics).
+
+Density / CUDA stability:
+    ``MACRO_PLACE_GPU_DENSITY_CHECKPOINT`` — default ``0`` (off). Set ``1`` to
+    trade VRAM for activation checkpointing in the PLC overlap density path
+    (checkpointing can trigger rare illegal-access errors on some CUDA stacks).
+    ``MACRO_PLACE_GPU_CUDA_FALLBACK`` — default ``1`` (on): **only** clear GPU OOM
+    (message contains ``out of memory``) retries on CPU. Other CUDA failures are not
+    retried: the device context is often unusable and copying parameters to CPU can
+    fail with the same error. Set ``0`` to never fall back to CPU.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import math
+import time
+import gc
+from pathlib import Path
+
+import torch
+from torch import nn
+
+from macro_place.benchmark import Benchmark
+from macro_place.routing_surrogate import grid_routing_capacities, smooth_routing_cong_plc, _macro_blockage_raw
+from macro_place.objective import compute_proxy_cost
+
+# Reuse proven, vectorized building blocks from the gradient baseline.
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from submissions.gradient import (
+    _assemble_full_fast,
+    _build_assemble_ctx,
+    _build_clamp_ctx,
+    _build_net_tensors,
+    _clamp_movable_fast,
+    _abu_top_mean,
+    _rudy_demand_grid,
+    _select_device,
+    _try_load_plc_iccad04,
+    _wirelength_loss_v2,
+)
+
+
+def _plc_overlap_density_chunk(
+    centers_xy: torch.Tensor,
+    wh: torch.Tensor,
+    bx0: torch.Tensor,
+    bx1: torch.Tensor,
+    by0: torch.Tensor,
+    by1: torch.Tensor,
+    bin_area: torch.Tensor,
+    cw: float,
+    ch: float,
+    nr: int,
+    nc: int,
+) -> torch.Tensor:
+    """Add overlap density contribution for a chunk of macros.
+
+    ``centers_xy``: [C,2], ``wh``: [C,2]
+    ``cw`` / ``ch`` are **full canvas** width and height (same as PlacementCost.width/height).
+    Bin bounds are broadcast grids with shape [nr, nc].
+    Returns a density increment with shape [nr, nc] summing over the C macros.
+    """
+    # Non-finite centers from upstream optimization can produce undefined long
+    # indices and rare illegal CUDA access; snap bad rows to canvas center.
+    finite = torch.isfinite(centers_xy).all(dim=-1, keepdim=True)
+    safe_c = centers_xy.new_tensor([0.5 * float(cw), 0.5 * float(ch)]).view(1, 2)
+    centers_xy = torch.where(finite, centers_xy, safe_c.expand_as(centers_xy))
+    wh_safe = torch.nan_to_num(wh, nan=1.0, posinf=max(float(cw), float(ch)), neginf=1e-9)
+    w = wh_safe[:, 0].clamp(min=1e-9, max=float(cw) + 1.0)
+    h = wh_safe[:, 1].clamp(min=1e-9, max=float(ch) + 1.0)
+    cx = centers_xy[:, 0]
+    cy = centers_xy[:, 1]
+
+    # Match PlacementCost.__get_grid_cell_location: floor(pos / grid_height), etc.
+    bin_w = float(cw) / float(max(nc, 1))
+    bin_h = float(ch) / float(max(nr, 1))
+
+    # Mirror PlacementCost.__add_module_to_grid_cells row/col windowing (clamp to grid).
+    ur_x = cx + 0.5 * w
+    ur_y = cy + 0.5 * h
+    bl_x = cx - 0.5 * w
+    bl_y = cy - 0.5 * h
+
+    ur_row = torch.floor((ur_y / bin_h).clamp(min=-1e9)).to(dtype=torch.long)
+    ur_col = torch.floor((ur_x / bin_w).clamp(min=-1e9)).to(dtype=torch.long)
+    bl_row = torch.floor((bl_y / bin_h).clamp(min=-1e9)).to(dtype=torch.long)
+    bl_col = torch.floor((bl_x / bin_w).clamp(min=-1e9)).to(dtype=torch.long)
+
+    # PLC: if upper-right cell is OOB (row or col < 0), skip module entirely.
+    oob_skip = (ur_row < 0) | (ur_col < 0)
+    # Else clamp negative bottom-left to 0.
+    bl_row = torch.where(~oob_skip & (bl_row < 0), torch.zeros_like(bl_row), bl_row)
+    bl_col = torch.where(~oob_skip & (bl_col < 0), torch.zeros_like(bl_col), bl_col)
+    # PLC: if bottom-left still invalid, skip.
+    oob_skip = oob_skip | (bl_row < 0) | (bl_col < 0)
+
+    ur_row = torch.where(~oob_skip & (ur_row > nr - 1), torch.full_like(ur_row, nr - 1), ur_row)
+    ur_col = torch.where(~oob_skip & (ur_col > nc - 1), torch.full_like(ur_col, nc - 1), ur_col)
+
+    # Convert to float masks on the grid by comparing row/col indices to arange tensors.
+    rs = torch.arange(nr, device=centers_xy.device, dtype=torch.long).view(1, nr, 1)
+    cs = torch.arange(nc, device=centers_xy.device, dtype=torch.long).view(1, 1, nc)
+
+    bl_r = bl_row.view(-1, 1, 1)
+    ur_r = ur_row.view(-1, 1, 1)
+    bl_c = bl_col.view(-1, 1, 1)
+    ur_c = ur_col.view(-1, 1, 1)
+
+    row_ok = (rs >= bl_r) & (rs <= ur_r)
+    col_ok = (cs >= bl_c) & (cs <= ur_c)
+    win = row_ok & col_ok  # [C, nr, nc]
+
+    m = (~oob_skip).view(-1, 1, 1).to(dtype=win.dtype)
+    win = win & m
+
+    cxg = cx.view(-1, 1, 1)
+    cyg = cy.view(-1, 1, 1)
+    wg = w.view(-1, 1, 1)
+    hg = h.view(-1, 1, 1)
+    lx = cxg - 0.5 * wg
+    rx = cxg + 0.5 * wg
+    by_m = cyg - 0.5 * hg
+    ty_m = cyg + 0.5 * hg
+
+    ix0 = torch.relu(torch.minimum(rx, bx1) - torch.maximum(lx, bx0))
+    iy0 = torch.relu(torch.minimum(ty_m, by1) - torch.maximum(by_m, by0))
+    contrib = (ix0 * iy0 / bin_area) * win.to(ix0.dtype)
+    return contrib.sum(dim=0)
+
+
+def _plc_proxy_density_cost(
+    dens: torch.Tensor,
+) -> torch.Tensor:
+    """Mirror ``PlacementCost.get_density_cost`` reduction on a dense grid.
+
+    This follows the structure in ``plc_client_os.PlacementCost.get_density_cost``:
+    - If total grid cells < 10: average of *occupied* (>0) cells, ×0.5
+    - Else: let ``density_cnt = floor(N * 0.1)`` (>=1). Sort occupied cells
+      descending and accumulate up to ``density_cnt`` terms (or exhaust occupied),
+      then divide by ``density_cnt`` (not by the number of accumulated terms),
+      and multiply by 0.5.
+    """
+    flat = dens.reshape(-1)
+    ncells = int(flat.numel())
+    if ncells == 0:
+        return torch.zeros((), device=flat.device, dtype=flat.dtype)
+
+    occ = flat[flat > 0]
+    if int(occ.numel()) == 0:
+        return torch.zeros((), device=flat.device, dtype=flat.dtype)
+
+    if ncells < 10:
+        return 0.5 * occ.mean()
+
+    density_cnt = max(1, int(math.floor(ncells * 0.1)))
+    occ_sorted, _ = torch.sort(occ, descending=True)
+    k = min(density_cnt, int(occ_sorted.numel()))
+    top = occ_sorted[:k]
+    return 0.5 * (top.sum() / float(density_cnt))
+
+
+def _plc_macro_overlap_density_grid_checkpointed(
+    full_pos: torch.Tensor,
+    benchmark: Benchmark,
+    cw: float,
+    ch: float,
+    nr: int,
+    nc: int,
+    *,
+    chunk: int,
+    use_checkpoint: bool,
+) -> torch.Tensor:
+    """PLC-style per-bin occupancy fraction, accumulated in macro chunks.
+
+    Optionally uses activation checkpointing on CUDA to save VRAM (see
+    ``MACRO_PLACE_GPU_DENSITY_CHECKPOINT``); when disabled, the full macro loop
+    still runs in chunks to limit peak graph size.
+    """
+    device, dtype = full_pos.device, full_pos.dtype
+    bw = cw / nc
+    bh = ch / nr
+    rs = torch.arange(nr, device=device, dtype=dtype).view(nr, 1).expand(nr, nc)
+    cs = torch.arange(nc, device=device, dtype=dtype).view(1, nc).expand(nr, nc)
+    bx0 = cs * bw
+    bx1 = bx0 + bw
+    by0 = rs * bh
+    by1 = by0 + bh
+    bin_area = bw * bh
+
+    sizes = benchmark.macro_sizes.to(device=device, dtype=dtype)
+    n = int(full_pos.shape[0])
+    dens = torch.zeros(nr, nc, device=device, dtype=dtype)
+
+    ck = max(int(chunk), 1)
+    for s in range(0, n, ck):
+        e = min(s + ck, n)
+        centers = full_pos[s:e]
+        wh = sizes[s:e]
+        if use_checkpoint:
+            dens = dens + torch.utils.checkpoint.checkpoint(
+                _plc_overlap_density_chunk,
+                centers,
+                wh,
+                bx0,
+                bx1,
+                by0,
+                by1,
+                torch.as_tensor(bin_area, device=device, dtype=dtype),
+                cw,
+                ch,
+                nr,
+                nc,
+                use_reentrant=False,
+            )
+        else:
+            dens = dens + _plc_overlap_density_chunk(
+                centers,
+                wh,
+                bx0,
+                bx1,
+                by0,
+                by1,
+                torch.as_tensor(bin_area, device=device, dtype=dtype),
+                cw,
+                ch,
+                nr,
+                nc,
+            )
+    return dens
+
+
+def _build_pin_net_tensors(
+    benchmark: Benchmark,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pin-level net tensors for HPWL (matches PlacementCost pin positions)."""
+    num_nets = int(benchmark.num_nets)
+
+    def _normalize_net_pins(pins: torch.Tensor) -> torch.Tensor:
+        """Return ``pins`` as a ``[num_pins, 2]`` long tensor on ``device``."""
+        p = pins.to(device=device, dtype=torch.long)
+        if p.numel() == 0:
+            return p.reshape(0, 2)
+        if p.dim() == 1:
+            if int(p.numel()) % 2 != 0:
+                raise ValueError(f"odd-length pin encoding: shape={tuple(pins.shape)}")
+            return p.reshape(-1, 2)
+        if p.dim() == 2:
+            if int(p.shape[-1]) == 2:
+                return p.reshape(-1, 2)
+            # Rare malformed shapes like [2,2] should be interpreted as 2 pins.
+            if int(p.numel()) % 2 == 0:
+                return p.reshape(-1, 2)
+        raise ValueError(f"unexpected net_pin_nodes shape: {tuple(pins.shape)}")
+
+    pin_rows: list[torch.Tensor] = []
+    max_pins = 0
+    for k in range(num_nets):
+        pr = _normalize_net_pins(benchmark.net_pin_nodes[k])
+        pin_rows.append(pr)
+        max_pins = max(max_pins, int(pr.shape[0]))
+
+    net_idx = torch.zeros((num_nets, max_pins, 2), dtype=torch.long, device=device)
+    net_mask = torch.zeros((num_nets, max_pins), dtype=torch.bool, device=device)
+
+    for k in range(num_nets):
+        pr = pin_rows[k]
+        n = int(pr.shape[0])
+        if n > 0:
+            net_idx[k, :n] = pr
+            net_mask[k, :n] = True
+
+    w_cpu = benchmark.net_weights
+    net_weights = torch.empty((num_nets,), device=device, dtype=dtype)
+    wl_w_mode = os.environ.get("MACRO_PLACE_WL_WEIGHT_MODE", "plc").strip().lower()
+    for k in range(num_nets):
+        pn = int(pin_rows[k].shape[0])
+        pc = max(pn, 2)
+        base_w = float(w_cpu[k].item())
+        if wl_w_mode in ("legacy", "divide", "pin_norm"):
+            wk = base_w / float(pc - 1)
+        else:
+            # Match ``PlacementCost.get_wirelength()``: per-net scale is the driver pin weight,
+            # not divided by number of pins.
+            wk = base_w
+        net_weights[k] = max(wk, 1e-6)
+
+    net_valid = torch.tensor(
+        [int(pin_rows[k].shape[0]) >= 2 for k in range(num_nets)],
+        device=device,
+        dtype=torch.bool,
+    )
+    return net_idx, net_mask, net_weights, net_valid
+
+
+def _pin_positions_for_hpwl(
+    owner_pos: torch.Tensor,
+    pin_owner: torch.Tensor,
+    pin_slot: torch.Tensor,
+    *,
+    n_hard: int,
+    macro_pin_offsets: list[torch.Tensor],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Absolute pin coordinates from owner centers + hard-macro pin offsets."""
+    n_nodes = int(owner_pos.shape[0])
+    # Guard OOB owner indices (padding or bad data); avoids illegal CUDA access on gather.
+    pin_owner = pin_owner.long().clamp(min=0, max=max(n_nodes - 1, 0))
+    pin_slot = pin_slot.long()
+
+    base = owner_pos[pin_owner]
+    off = torch.zeros_like(base)
+
+    if n_hard <= 0:
+        return base
+
+    hard_owner = pin_owner < int(n_hard)
+    if not torch.any(hard_owner):
+        return base
+
+    ho = pin_owner[hard_owner].contiguous()
+    hs = pin_slot[hard_owner].contiguous()
+    ox = torch.zeros((ho.shape[0],), device=owner_pos.device, dtype=dtype)
+    oy = torch.zeros((ho.shape[0],), device=owner_pos.device, dtype=dtype)
+
+    # Typically a small loop over hard macros (tens–low hundreds), keeps offsets exact.
+    for mi in range(int(n_hard)):
+        m = ho == mi
+        if not torch.any(m):
+            continue
+        offs = macro_pin_offsets[mi].to(device=owner_pos.device, dtype=dtype)
+        if offs.numel() == 0:
+            continue
+        slots = hs[m].clamp(min=0, max=max(int(offs.shape[0]) - 1, 0)).long()
+        sel = offs[slots]
+        ox[m] = sel[:, 0]
+        oy[m] = sel[:, 1]
+
+    off[hard_owner, 0] = ox
+    off[hard_owner, 1] = oy
+    return base + off
+
+
+def _training_plots_enabled() -> bool:
+    return os.environ.get("MACRO_PLACE_GPU_TRAINING_PLOT", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _save_proxy_vs_epoch_plot(name: str, epochs: list[int], proxies: list[float]) -> bool:
+    """Save PLC proxy vs epoch when matplotlib is available. Returns True if a file was written."""
+    if not epochs:
+        return False
+    if not _training_plots_enabled():
+        return False
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[gpu_placer] matplotlib missing; skip proxy vs epoch plot", flush=True)
+        return False
+
+    vis = _ROOT / "vis"
+    vis.mkdir(parents=True, exist_ok=True)
+    out = vis / f"{name}_gpu_proxy_vs_epoch.png"
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(epochs, proxies, color="tab:blue", linewidth=1.2, marker="o", markersize=3)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("PLC proxy_cost")
+    ax.set_title(f"{name} — GpuPlacer PLC proxy vs epoch")
+    ax.grid(True, alpha=0.35)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[gpu_placer] proxy vs epoch plot saved to {out.resolve()}", flush=True)
+    return True
+
+
+def _save_surrogate_loss_vs_epoch_plot(name: str, epochs: list[int], losses: list[float]) -> bool:
+    """Save surrogate total loss vs epoch (GPU-side objective) when matplotlib is available."""
+    if not epochs:
+        return False
+    if not _training_plots_enabled():
+        return False
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[gpu_placer] matplotlib missing; skip surrogate loss plot", flush=True)
+        return False
+
+    vis = _ROOT / "vis"
+    vis.mkdir(parents=True, exist_ok=True)
+    out = vis / f"{name}_gpu_surrogate_loss_vs_epoch.png"
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(epochs, losses, color="tab:orange", linewidth=1.2, marker="o", markersize=2)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Surrogate loss (GpuPlacer)")
+    ax.set_title(f"{name} — surrogate total loss vs epoch")
+    ax.grid(True, alpha=0.35)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[gpu_placer] surrogate loss plot saved to {out.resolve()}", flush=True)
+    return True
+
+
+def _report_training_plots(
+    *,
+    plc_loaded: bool,
+    proxy_check_every: int,
+    log_every: int,
+    saved_proxy: bool,
+    saved_surr: bool,
+) -> None:
+    if saved_proxy or saved_surr:
+        return
+    parts: list[str] = []
+    if not plc_loaded:
+        parts.append("PlacementCost (ICCAD04) did not load")
+    elif proxy_check_every <= 0:
+        parts.append("MACRO_PLACE_GPU_PROXY_CHECK_EVERY is 0")
+    if log_every <= 0:
+        parts.append("log_every is 0 (no surrogate samples)")
+    if not parts:
+        parts.append("matplotlib missing, MACRO_PLACE_GPU_TRAINING_PLOT=0, or no data")
+    print(
+        f"[gpu_placer] no training plot saved ({'; '.join(parts)}). "
+        "Install matplotlib or fix ICC paths; surrogate PNG uses log_every>0.",
+        flush=True,
+    )
+
+
+def _make_gpu_optimizer(params: list[nn.Parameter], lr: float) -> torch.optim.Optimizer:
+    """Adam (default) or SGD+Nesterov via ``MACRO_PLACE_GPU_OPTIMIZER``."""
+    kind = os.environ.get("MACRO_PLACE_GPU_OPTIMIZER", "adam").strip().lower()
+    if kind in ("nesterov", "sgd_nesterov", "nesterov_sgd"):
+        mom = float(os.environ.get("MACRO_PLACE_GPU_MOMENTUM", "0.9") or "0.9")
+        opt = torch.optim.SGD(
+            params,
+            lr=lr,
+            momentum=mom,
+            dampening=0,
+            weight_decay=0.0,
+            nesterov=True,
+        )
+        print(
+            f"[gpu_placer] optimizer=SGD+Nesterov lr={lr:g} momentum={mom:g}",
+            flush=True,
+        )
+        return opt
+    if kind not in ("adam", ""):
+        print(
+            f"[gpu_placer] unknown MACRO_PLACE_GPU_OPTIMIZER={kind!r}; using Adam",
+            flush=True,
+        )
+    print(f"[gpu_placer] optimizer=Adam lr={lr:g}", flush=True)
+    return torch.optim.Adam(params, lr=lr)
+
+
+def _cuda_teardown_after_training() -> None:
+    """Drain async CUDA work and release cached allocations before CPU copy / matplotlib."""
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    gc.collect()
+
+
+class GpuPlacer:
+    """
+    GPU-first differentiable placer.
+
+    - Optimizes smooth-HPWL + soft density.
+    - Keeps macros within the canvas via clamping.
+    - Does not enforce non-overlap.
+    - Optional PLC-proxy early-stop: ``stagnation_min_abs_improvement`` (see module
+      doc / ``MACRO_PLACE_GPU_STAGNATION_MIN_ABS_IMPROVEMENT``).
+    - Training curves under ``vis/`` are written by default (disable with env
+      ``MACRO_PLACE_GPU_TRAINING_PLOT=0``).
+    """
+
+    def __init__(
+        self,
+        *,
+        epochs: int | None = None,
+        lr: float = 2e-2,
+        beta: float = 1.0,
+        w_wl: float = 1.0,
+        w_density: float = 0.5,
+        w_cong: float = 0.5,
+        w_overlap: float = 1.0,
+        target_density: float = 0.7,
+        seed: int = 0,
+        log_every: int = 50,
+        stagnation_proxy_patience: int | None = None,
+        stagnation_proxy_rel_delta: float | None = None,
+        stagnation_min_abs_improvement: float | None = None,
+    ) -> None:
+        self.epochs = int(epochs) if epochs is not None else int(
+            os.environ.get("MACRO_PLACE_GPU_EPOCHS", "5000")
+        )
+        if stagnation_proxy_patience is None:
+            stagnation_proxy_patience = int(
+                os.environ.get("MACRO_PLACE_GPU_STAGNATION_PATIENCE", "0") or "0"
+            )
+        if stagnation_proxy_rel_delta is None:
+            stagnation_proxy_rel_delta = float(
+                os.environ.get("MACRO_PLACE_GPU_STAGNATION_REL_DELTA", "0.01") or "0.01"
+            )
+        if stagnation_min_abs_improvement is None:
+            if "MACRO_PLACE_PE_STAGNATION_MIN_ABS_IMPROVEMENT" in os.environ:
+                raw_pe = os.environ.get("MACRO_PLACE_PE_STAGNATION_MIN_ABS_IMPROVEMENT", "") or ""
+                stagnation_min_abs_improvement = float(raw_pe.strip() or "0")
+            else:
+                stagnation_min_abs_improvement = float(
+                    os.environ.get("MACRO_PLACE_GPU_STAGNATION_MIN_ABS_IMPROVEMENT", "0.01")
+                    or "0.01"
+                )
+        self.stagnation_proxy_patience = max(0, int(stagnation_proxy_patience))
+        self.stagnation_proxy_rel_delta = float(stagnation_proxy_rel_delta)
+        self.stagnation_min_abs_improvement = float(stagnation_min_abs_improvement)
+        self.lr = float(lr)
+        self.beta = float(beta)
+        self.w_wl = float(w_wl)
+        self.w_density = float(w_density)
+        self.w_cong = float(w_cong)
+        self.w_overlap = float(w_overlap)
+        self.target_density = float(target_density)
+        self.seed = int(seed)
+        self.log_every = int(log_every)
+
+    def place(
+        self,
+        benchmark: Benchmark,
+        *,
+        initial_macro_positions: torch.Tensor | None = None,
+        telemetry: dict | None = None,
+    ) -> torch.Tensor:
+        """If ``telemetry`` is a dict, it is filled with ``epochs_completed`` (int) and
+        ``wall_seconds`` (float) for the differentiable training loop only (``_run_on_device``,
+        including OOM CPU fallback re-run), excluding matplotlib plot I/O at the end.
+        """
+        torch.manual_seed(self.seed)
+
+        # Prefer CUDA if available; allow env override via existing helper.
+        device = _select_device(benchmark)
+        # Frozen reference for CUDA->CPU fallback: ``_run_on_device`` must detect when
+        # ``run_device`` differs from the device used to allocate ``pos_*`` / constants.
+        # Do not compare to ``device`` after the except block may reassign it to CPU.
+        param_device = device
+        if device.type != "cuda" and torch.cuda.is_available():
+            # If user didn't force cpu, _select_device will choose cuda. If we end
+            # up here, they likely forced cpu; keep it as-is.
+            pass
+        if device.type == "cuda":
+            # Reduce the chance of catastrophic driver crashes by failing fast on
+            # async CUDA errors and by limiting the size of soft-density graphs.
+            # (These are safe no-ops on CPU.)
+            os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+
+        dtype = torch.float32
+        n_hard = int(benchmark.num_hard_macros)
+        n_macros = int(benchmark.num_macros)
+        n_soft = int(benchmark.num_soft_macros)
+        cw = float(benchmark.canvas_width)
+        ch = float(benchmark.canvas_height)
+        fixed = benchmark.macro_fixed
+
+        movable_hard_idx = [i for i in range(n_hard) if not bool(fixed[i].item())]
+        if initial_macro_positions is not None:
+            orig = initial_macro_positions.to(device=device, dtype=dtype)
+        else:
+            orig = benchmark.macro_positions.to(device=device, dtype=dtype)
+
+        if not movable_hard_idx and n_soft == 0:
+            if telemetry is not None:
+                telemetry["epochs_completed"] = 0
+                telemetry["wall_seconds"] = 0.0
+            return benchmark.macro_positions.clone()
+
+        if movable_hard_idx:
+            pos_hard = nn.Parameter(torch.stack([orig[i].clone() for i in movable_hard_idx]))
+        else:
+            pos_hard = nn.Parameter(torch.zeros(0, 2, device=device, dtype=dtype))
+        if n_soft > 0:
+            pos_soft = nn.Parameter(orig[n_hard:n_macros].clone())
+        else:
+            pos_soft = nn.Parameter(torch.zeros(0, 2, device=device, dtype=dtype))
+
+        params: list[nn.Parameter] = []
+        if pos_hard.numel() > 0:
+            params.append(pos_hard)
+        if pos_soft.numel() > 0:
+            params.append(pos_soft)
+
+        opt = _make_gpu_optimizer(params, self.lr)
+
+        def _rebuild_optimizer() -> None:
+            nonlocal opt
+            ps: list[nn.Parameter] = []
+            if pos_hard.numel() > 0:
+                ps.append(pos_hard)
+            if pos_soft.numel() > 0:
+                ps.append(pos_soft)
+            opt = _make_gpu_optimizer(ps, self.lr)
+
+        # PLC is used for proxy logging and for matching PlacementCost WL normalization:
+        # get_cost() == get_wirelength() / ((W+H) * plc.net_cnt)
+        proxy_check_every = int(os.environ.get("MACRO_PLACE_GPU_PROXY_CHECK_EVERY", "100") or "100")
+        plc = _try_load_plc_iccad04(benchmark)
+
+        net_cnt = float(benchmark.num_nets)
+        if plc is not None:
+            nc = float(getattr(plc, "net_cnt", 0.0) or 0.0)
+            if nc > 0.0:
+                net_cnt = nc
+        wl_norm = (cw + ch) * max(net_cnt, 1e-9)
+
+        use_pin_wl = len(benchmark.net_pin_nodes) == int(benchmark.num_nets)
+
+        # Build constant tensors once on-device.
+        ports = benchmark.port_positions.to(device=device, dtype=dtype)
+        net_idx_macro, net_mask_macro, net_weights_macro, net_valid_macro = _build_net_tensors(
+            benchmark, device, dtype
+        )
+        if use_pin_wl:
+            net_idx_wl, net_mask_wl, net_weights_wl, net_valid_wl = _build_pin_net_tensors(
+                benchmark, device, dtype
+            )
+        else:
+            net_idx_wl, net_mask_wl, net_weights_wl, net_valid_wl = (
+                net_idx_macro,
+                net_mask_macro,
+                net_weights_macro,
+                net_valid_macro,
+            )
+
+        nr = max(int(benchmark.grid_rows), 1)
+        nc = max(int(benchmark.grid_cols), 1)
+
+        assemble_ctx = _build_assemble_ctx(benchmark, device, dtype)
+        clamp_ctx = _build_clamp_ctx(
+            benchmark, assemble_ctx[1], n_hard, cw, ch, device, dtype
+        )
+
+        # Density: PLC-style bin overlap occupancy + proxy reduction (see PlacementCost density).
+        dens_chunk = int(os.environ.get("MACRO_PLACE_GPU_DENSITY_CHUNK", "16") or "16")
+        dens_ckpt_env = os.environ.get("MACRO_PLACE_GPU_DENSITY_CHECKPOINT", "").strip().lower()
+        if dens_ckpt_env in ("1", "true", "yes", "on"):
+            dens_use_ckpt = True
+        elif dens_ckpt_env in ("0", "false", "no", "off"):
+            dens_use_ckpt = False
+        else:
+            # Default off: checkpointed backward on CUDA has been a common source
+            # of illegal-memory-access reports; enable explicitly with =1 if VRAM
+            # requires it (often with a smaller MACRO_PLACE_GPU_DENSITY_CHUNK).
+            dens_use_ckpt = False
+
+        # RUDY congestion: build routing bin bounds on-device.
+        cell_w = cw / nc
+        cell_h = ch / nr
+        bin_x0 = (torch.arange(nc, device=device, dtype=dtype) * cell_w).view(1, nc).expand(nr, nc)
+        bin_x1 = bin_x0 + cell_w
+        bin_y0 = (torch.arange(nr, device=device, dtype=dtype) * cell_h).view(nr, 1).expand(nr, nc)
+        bin_y1 = bin_y0 + cell_h
+
+        sizes = benchmark.macro_sizes.to(device=device, dtype=dtype)
+        fixed_mask = benchmark.macro_fixed.to(device=device)
+        eps_canvas = torch.tensor(max(cw * ch, 1e-12), device=device, dtype=dtype)
+
+        # PLC-aligned normalization constants for "corrected RUDY".
+        grid_h_routes, grid_v_routes = grid_routing_capacities(benchmark)
+        gh = torch.tensor(max(float(grid_h_routes), 1e-30), device=device, dtype=dtype)
+        gv = torch.tensor(max(float(grid_v_routes), 1e-30), device=device, dtype=dtype)
+        smooth_cong = int(benchmark.congestion_smooth_range)
+        h_ma = float(benchmark.hrouting_alloc)
+        v_ma = float(benchmark.vrouting_alloc)
+
+        log_path = Path(os.environ.get("MACRO_PLACE_GPU_LOG_PATH", "gpu_proxycheck.csv"))
+        log_fp = None
+        if plc is not None and proxy_check_every > 0:
+            log_fp = open(log_path, "a", encoding="utf-8")
+            if log_fp.tell() == 0:
+                log_fp.write(
+                    "epoch,"
+                    "sur_wl,sur_den,sur_cong,sur_ovl,sur_loss,"
+                    "px_proxy,px_wl,px_den,px_cong,px_ovl_pairs,"
+                    "d_wl,d_den,d_cong,d_proxy\n"
+                )
+                log_fp.flush()
+
+        proxy_epochs: list[int] = []
+        proxy_values: list[float] = []
+        surrogate_epochs: list[int] = []
+        surrogate_losses: list[float] = []
+        run_meta: dict[str, int] = {"epochs_completed": 0}
+
+        def _overlap_loss(full_pos: torch.Tensor) -> torch.Tensor:
+            # Soft overlap penalty from pairwise rectangle intersections (all macros, incl. fixed).
+            # Pure torch ops => stays on GPU; gradients flow to movable params only.
+            # Use triu(..., diagonal=1) only — avoid diag_embed(diagonal(...)) which has
+            # triggered autograd storage overflows on some Windows/CUDA stacks.
+            if full_pos.shape[0] <= 1:
+                return torch.zeros((), device=full_pos.device, dtype=full_pos.dtype)
+            cx = full_pos[:, 0]
+            cy = full_pos[:, 1]
+            w = sizes[:, 0]
+            h = sizes[:, 1]
+            lx = cx - 0.5 * w
+            rx = cx + 0.5 * w
+            by = cy - 0.5 * h
+            ty = cy + 0.5 * h
+
+            ix = torch.relu(torch.minimum(rx[:, None], rx[None, :]) - torch.maximum(lx[:, None], lx[None, :]))
+            iy = torch.relu(torch.minimum(ty[:, None], ty[None, :]) - torch.maximum(by[:, None], by[None, :]))
+            area = ix * iy
+            pair = torch.triu(area, diagonal=1)
+
+            # Only count each pair once (upper triangle); diagonal is already excluded.
+            if fixed_mask.numel() == full_pos.shape[0]:
+                fixed_pair = (fixed_mask[:, None] & fixed_mask[None, :]).to(pair.dtype)
+                pair = pair * (1.0 - torch.triu(fixed_pair, diagonal=1))
+
+            # Normalize to canvas area to keep magnitudes stable.
+            return pair.sum() / eps_canvas
+
+        def _run_on_device(run_device: torch.device) -> torch.Tensor:
+            nonlocal ports
+            nonlocal net_idx_macro, net_mask_macro, net_weights_macro, net_valid_macro
+            nonlocal net_idx_wl, net_mask_wl, net_weights_wl, net_valid_wl
+            nonlocal assemble_ctx, clamp_ctx
+            nonlocal bin_x0, bin_x1, bin_y0, bin_y1
+            nonlocal sizes, fixed_mask, eps_canvas
+            nonlocal gh, gv, smooth_cong, h_ma, v_ma
+            if run_device != param_device:
+                # Rebuild all constant tensors on the fallback device.
+                ports = benchmark.port_positions.to(device=run_device, dtype=dtype)
+                net_idx_macro, net_mask_macro, net_weights_macro, net_valid_macro = _build_net_tensors(
+                    benchmark, run_device, dtype
+                )
+                if use_pin_wl:
+                    net_idx_wl, net_mask_wl, net_weights_wl, net_valid_wl = _build_pin_net_tensors(
+                        benchmark, run_device, dtype
+                    )
+                else:
+                    net_idx_wl, net_mask_wl, net_weights_wl, net_valid_wl = (
+                        net_idx_macro,
+                        net_mask_macro,
+                        net_weights_macro,
+                        net_valid_macro,
+                    )
+                assemble_ctx = _build_assemble_ctx(benchmark, run_device, dtype)
+                clamp_ctx = _build_clamp_ctx(
+                    benchmark, assemble_ctx[1], n_hard, cw, ch, run_device, dtype
+                )
+                bin_x0 = (torch.arange(nc, device=run_device, dtype=dtype) * cell_w).view(1, nc).expand(nr, nc)
+                bin_x1 = bin_x0 + cell_w
+                bin_y0 = (torch.arange(nr, device=run_device, dtype=dtype) * cell_h).view(nr, 1).expand(nr, nc)
+                bin_y1 = bin_y0 + cell_h
+                sizes = benchmark.macro_sizes.to(device=run_device, dtype=dtype)
+                fixed_mask = benchmark.macro_fixed.to(device=run_device)
+                eps_canvas = torch.tensor(max(cw * ch, 1e-12), device=run_device, dtype=dtype)
+                gh = torch.tensor(max(float(grid_h_routes), 1e-30), device=run_device, dtype=dtype)
+                gv = torch.tensor(max(float(grid_v_routes), 1e-30), device=run_device, dtype=dtype)
+                if pos_hard.numel() > 0:
+                    pos_hard.data = pos_hard.data.to(run_device)
+                if pos_soft.numel() > 0:
+                    pos_soft.data = pos_soft.data.to(run_device)
+                # Adam state must live on the same device as parameters after migration.
+                _rebuild_optimizer()
+
+            stag_best: float | None = None
+            stag_streak = 0
+
+            proxy_epochs.clear()
+            proxy_values.clear()
+            surrogate_epochs.clear()
+            surrogate_losses.clear()
+
+            last_good_hard: torch.Tensor | None = (
+                pos_hard.detach().clone() if pos_hard.numel() > 0 else None
+            )
+            last_good_soft: torch.Tensor | None = (
+                pos_soft.detach().clone() if pos_soft.numel() > 0 else None
+            )
+
+            def _restore_last_good_params() -> None:
+                if last_good_hard is not None and pos_hard.numel() > 0:
+                    pos_hard.data.copy_(last_good_hard.to(pos_hard.device))
+                if last_good_soft is not None and pos_soft.numel() > 0:
+                    pos_soft.data.copy_(last_good_soft.to(pos_soft.device))
+
+            def _snapshot_good_params() -> None:
+                nonlocal last_good_hard, last_good_soft
+                if pos_hard.numel() > 0 and torch.isfinite(pos_hard).all():
+                    last_good_hard = pos_hard.detach().clone()
+                if pos_soft.numel() > 0 and torch.isfinite(pos_soft).all():
+                    last_good_soft = pos_soft.detach().clone()
+
+            for epoch in range(self.epochs):
+                opt.zero_grad(set_to_none=True)
+
+                full = _assemble_full_fast(pos_hard, pos_soft, assemble_ctx)
+                combined_pos = torch.cat([full, ports], dim=0)
+
+                if use_pin_wl:
+                    pin_owner = net_idx_wl[:, :, 0]
+                    pin_slot = net_idx_wl[:, :, 1]
+                    pin_flat = _pin_positions_for_hpwl(
+                        combined_pos,
+                        pin_owner,
+                        pin_slot,
+                        n_hard=n_hard,
+                        macro_pin_offsets=benchmark.macro_pin_offsets,
+                        dtype=dtype,
+                    )
+                    num_nets_wl = int(net_idx_wl.shape[0])
+                    max_pins_wl = int(net_idx_wl.shape[1])
+                    wl_pos = pin_flat.reshape(num_nets_wl * max_pins_wl, 2)
+                    wl_idx = (
+                        torch.arange(num_nets_wl, device=run_device, dtype=torch.long).view(-1, 1)
+                        * max_pins_wl
+                        + torch.arange(max_pins_wl, device=run_device, dtype=torch.long).view(1, -1)
+                    )
+                else:
+                    wl_pos = combined_pos
+                    wl_idx = net_idx_wl
+
+                l_wl_raw = _wirelength_loss_v2(
+                    wl_pos,
+                    wl_idx,
+                    net_mask_wl,
+                    net_weights_wl,
+                    net_valid_wl,
+                    self.beta,
+                )
+                l_wl = l_wl_raw / wl_norm
+
+                # Density: PLC overlap grid + proxy-style top-10% scalar (×0.5).
+                if self.w_density != 0.0:
+                    dens_grid = _plc_macro_overlap_density_grid_checkpointed(
+                        full,
+                        benchmark,
+                        cw,
+                        ch,
+                        nr,
+                        nc,
+                        chunk=dens_chunk,
+                        use_checkpoint=(dens_use_ckpt and run_device.type == "cuda"),
+                    )
+                    l_den = _plc_proxy_density_cost(dens_grid)
+                else:
+                    l_den = torch.zeros((), device=run_device, dtype=dtype)
+
+                # Congestion ("corrected RUDY"):
+                # - fast RUDY net demand grid
+                # - normalize by routing capacities
+                # - PLC smoothing on net maps
+                # - add PLC macro blockage (after smoothing)
+                # - reduce as top-5% mean over H/V cells combined
+                if self.w_cong != 0.0:
+                    demand = _rudy_demand_grid(
+                        combined_pos,
+                        net_idx_macro,
+                        net_mask_macro,
+                        net_weights_macro,
+                        net_valid_macro,
+                        self.beta,
+                        bin_x0,
+                        bin_x1,
+                        bin_y0,
+                        bin_y1,
+                    )
+                    # RUDY demand is not directional; we align to proxy structure by applying
+                    # the PLC normalization/smoothing/blockage pipeline to two utilization maps.
+                    H_net = demand / gh
+                    V_net = demand / gv
+                    H_net, V_net = smooth_routing_cong_plc(H_net, V_net, smooth_cong)
+
+                    h_blk, v_blk = _macro_blockage_raw(
+                        full,
+                        benchmark,
+                        nr,
+                        nc,
+                        cw,
+                        ch,
+                        n_hard,
+                        h_ma,
+                        v_ma,
+                    )
+                    H_tot = H_net + (h_blk / gh)
+                    V_tot = V_net + (v_blk / gv)
+                    both = torch.cat([V_tot.reshape(-1), H_tot.reshape(-1)])
+                    l_cong = _abu_top_mean(both, 0.05)
+                else:
+                    l_cong = torch.zeros((), device=run_device, dtype=dtype)
+
+                # Overlap avoidance: penalize pairwise overlap area.
+                l_ovl = _overlap_loss(full) if self.w_overlap != 0.0 else torch.zeros((), device=run_device, dtype=dtype)
+
+                loss = self.w_wl * l_wl + self.w_density * l_den + self.w_cong * l_cong + self.w_overlap * l_ovl
+                if not torch.isfinite(loss) or not torch.isfinite(full).all():
+                    bad_terms = [
+                        name
+                        for name, term in (
+                            ("wl", l_wl),
+                            ("den", l_den),
+                            ("cong", l_cong),
+                            ("ovl", l_ovl),
+                        )
+                        if not torch.isfinite(term)
+                    ]
+                    print(
+                        "[gpu_placer] stopped: non-finite surrogate or placement "
+                        f"(epoch {epoch + 1}); reverting to last good params. "
+                        f"non_finite_terms={bad_terms or ['placement']}",
+                        flush=True,
+                    )
+                    _restore_last_good_params()
+                    break
+
+                loss.backward()
+                opt.step()
+
+                # Keep centers in-bounds (still allows overlaps).
+                _clamp_movable_fast(pos_hard, pos_soft, clamp_ctx)
+
+                if not (
+                    (pos_hard.numel() == 0 or torch.isfinite(pos_hard).all())
+                    and (pos_soft.numel() == 0 or torch.isfinite(pos_soft).all())
+                ):
+                    print(
+                        "[gpu_placer] stopped: non-finite movable parameters after optimizer step "
+                        f"(epoch {epoch + 1}); reverting to last good params.",
+                        flush=True,
+                    )
+                    _restore_last_good_params()
+                    break
+
+                _snapshot_good_params()
+
+                run_meta["epochs_completed"] = epoch + 1
+
+                if self.log_every > 0 and (epoch == 0 or (epoch + 1) % self.log_every == 0):
+                    lw = float(l_wl.detach().cpu().item())
+                    ld = float(l_den.detach().cpu().item())
+                    lc = float(l_cong.detach().cpu().item())
+                    lo = float(l_ovl.detach().cpu().item())
+                    ls = float(loss.detach().cpu().item())
+                    surrogate_epochs.append(epoch + 1)
+                    surrogate_losses.append(ls)
+                    print(
+                        f"[gpu_placer] epoch={epoch+1}/{self.epochs} "
+                        f"loss={ls:.6g} wl={lw:.6g} den={ld:.6g} cong={lc:.6g} ovl={lo:.6g} "
+                        f"device={run_device.type} bins={nr}x{nc}",
+                        flush=True,
+                    )
+
+                # Evaluator proxy check (CPU) for surrogate accuracy diagnostics.
+                if (
+                    plc is not None
+                    and proxy_check_every > 0
+                    and ((epoch + 1) % proxy_check_every == 0 or epoch == 0)
+                ):
+                    with torch.no_grad():
+                        if not torch.isfinite(full).all():
+                            print(
+                                "[gpu_placer] skipping PLC proxy check: non-finite full placement "
+                                f"(epoch {epoch + 1}).",
+                                flush=True,
+                            )
+                            break
+                        full_cpu = full.detach().to(device="cpu", dtype=torch.float32)
+                        costs = compute_proxy_cost(full_cpu, benchmark, plc)
+                        px_proxy = float(costs["proxy_cost"])
+                        px_wl = float(costs["wirelength_cost"])
+                        px_den = float(costs["density_cost"])
+                        px_cong = float(costs["congestion_cost"])
+                        px_ovl = int(costs["overlap_count"])
+
+                        proxy_epochs.append(epoch + 1)
+                        proxy_values.append(px_proxy)
+
+                        # Surrogates are on different scales than proxy costs; deltas are still useful.
+                        d_wl = px_wl - float(l_wl.detach().cpu().item())
+                        d_den = px_den - float(l_den.detach().cpu().item())
+                        d_cong = px_cong - float(l_cong.detach().cpu().item())
+                        d_proxy = px_proxy - float(loss.detach().cpu().item())
+
+                        if log_fp is not None:
+                            log_fp.write(
+                                f"{epoch+1},"
+                                f"{float(l_wl.detach().cpu().item()):.10g},"
+                                f"{float(l_den.detach().cpu().item()):.10g},"
+                                f"{float(l_cong.detach().cpu().item()):.10g},"
+                                f"{float(l_ovl.detach().cpu().item()):.10g},"
+                                f"{float(loss.detach().cpu().item()):.10g},"
+                                f"{px_proxy:.10g},{px_wl:.10g},{px_den:.10g},{px_cong:.10g},{px_ovl},"
+                                f"{d_wl:.10g},{d_den:.10g},{d_cong:.10g},{d_proxy:.10g}\n"
+                            )
+                            log_fp.flush()
+
+                        min_abs = float(self.stagnation_min_abs_improvement)
+                        if min_abs > 0.0:
+                            if stag_best is None:
+                                stag_best = float(px_proxy)
+                            else:
+                                best_before = float(stag_best)
+                                new_best = min(best_before, float(px_proxy))
+                                delta = best_before - new_best
+                                stag_best = new_best
+                                if delta < min_abs:
+                                    print(
+                                        "[gpu_placer] stagnation: PLC proxy improved only "
+                                        f"{delta:.6g} vs best over last {proxy_check_every} epochs "
+                                        f"(min required {min_abs:g}); "
+                                        f"best={stag_best:.6g} current={px_proxy:.6g}.",
+                                        flush=True,
+                                    )
+                                    break
+                        elif self.stagnation_proxy_patience > 0:
+                            thr = max(
+                                1e-12,
+                                abs(float(px_proxy)) * self.stagnation_proxy_rel_delta,
+                            )
+                            if stag_best is None:
+                                stag_best = float(px_proxy)
+                                stag_streak = 0
+                            elif float(px_proxy) < float(stag_best) - thr:
+                                stag_best = float(px_proxy)
+                                stag_streak = 0
+                            else:
+                                stag_streak += 1
+                                if stag_streak >= self.stagnation_proxy_patience:
+                                    print(
+                                        "[gpu_placer] stagnation: PLC proxy did not improve by "
+                                        f"rel>{self.stagnation_proxy_rel_delta} for "
+                                        f"{self.stagnation_proxy_patience} consecutive checks "
+                                        f"(best={stag_best:.6g}, current={px_proxy:.6g}).",
+                                        flush=True,
+                                    )
+                                    break
+            return full
+
+        cuda_fb_env = os.environ.get("MACRO_PLACE_GPU_CUDA_FALLBACK", "1").strip().lower()
+        cuda_cpu_fallback = cuda_fb_env not in ("0", "false", "no", "off")
+
+        def _cuda_message_is_oom(err: Exception) -> bool:
+            if "out of memory" in str(err).lower():
+                return True
+            c = getattr(err, "__cause__", None)
+            return bool(c and "out of memory" in str(c).lower())
+
+        t_train0 = time.perf_counter()
+        try:
+            full = _run_on_device(device)
+        except RuntimeError as e:
+            is_oom = _cuda_message_is_oom(e)
+            if device.type == "cuda" and cuda_cpu_fallback and is_oom:
+                print(
+                    "[gpu_placer] CUDA OOM; falling back to CPU for stability.",
+                    flush=True,
+                )
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                device = torch.device("cpu")
+                full = _run_on_device(device)
+            elif device.type == "cuda" and cuda_cpu_fallback and not is_oom and (
+                "cuda" in str(e).lower() or "accelerator" in type(e).__name__.lower()
+            ):
+                raise RuntimeError(
+                    "[gpu_placer] CUDA failure that is not a clear out-of-memory condition; "
+                    "not falling back to CPU (the GPU context is often poisoned, and copying "
+                    "parameters to CPU usually hits the same error). Start a fresh process, "
+                    "try MACRO_PLACE_GPU_DENSITY_CHUNK smaller, CUDA_LAUNCH_BLOCKING=1 once to "
+                    "localize, or set MACRO_PLACE_GPU_CUDA_FALLBACK=0 to skip this message path. "
+                    f"Original: {e}"
+                ) from e
+            else:
+                if device.type == "cuda" and not cuda_cpu_fallback and (
+                    "cuda" in str(e).lower() or "accelerator" in type(e).__name__.lower()
+                ):
+                    raise RuntimeError(
+                        "[gpu_placer] CUDA error with MACRO_PLACE_GPU_CUDA_FALLBACK=0 "
+                        "(CPU fallback disabled). Mitigations: ensure density checkpoint stays off "
+                        "(default), set MACRO_PLACE_GPU_DENSITY_CHECKPOINT=0 explicitly, reduce "
+                        "MACRO_PLACE_GPU_DENSITY_CHUNK or batch size, run a fresh process after "
+                        "VRAM pressure, or set CUDA_LAUNCH_BLOCKING=1 once to localize the op."
+                    ) from e
+                raise
+        t_train1 = time.perf_counter()
+        if device.type == "cuda":
+            _cuda_teardown_after_training()
+        if telemetry is not None:
+            telemetry["epochs_completed"] = int(run_meta["epochs_completed"])
+            telemetry["wall_seconds"] = float(t_train1 - t_train0)
+
+        plc_loaded = plc is not None
+        saved_proxy = _save_proxy_vs_epoch_plot(benchmark.name, proxy_epochs, proxy_values)
+        saved_surr = _save_surrogate_loss_vs_epoch_plot(
+            benchmark.name, surrogate_epochs, surrogate_losses
+        )
+        _report_training_plots(
+            plc_loaded=plc_loaded,
+            proxy_check_every=proxy_check_every,
+            log_every=self.log_every,
+            saved_proxy=saved_proxy,
+            saved_surr=saved_surr,
+        )
+
+        # Return full placement on CPU in the expected dtype.
+        out = benchmark.macro_positions.clone()
+        out[:n_hard] = full[:n_hard].detach().to(device=out.device, dtype=out.dtype)
+        if n_soft > 0:
+            out[n_hard:n_macros] = full[n_hard:n_macros].detach().to(
+                device=out.device, dtype=out.dtype
+            )
+        # Preserve fixed macros exactly.
+        out[fixed] = benchmark.macro_positions[fixed]
+        return out
+

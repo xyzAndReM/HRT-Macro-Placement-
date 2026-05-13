@@ -1,0 +1,91 @@
+================================================================================
+Annotated log: IBM04 gradient run (GradientPlacer / evaluate_gradient_random_start)
+Source: terminal capture (surrogate_vs_proxy checkpoints + final summary)
+Generated: 2026-05-04
+================================================================================
+
+--- Run configuration ---
+Benchmark:        ibm04 (ICCAD04)
+Start layout:     initial.plc (--no-randomize)
+Training epochs:  900
+train_seed:       0
+Proxy checkpoints: every 50 epochs (epochs 49, 99, ... 899 in 0-based indexing)
+
+--- PlacementCost / benchmark meta (from loader) ---
+Netlist:   .../ICCAD04/ibm04/netlist.pb.txt
+Grid:      Col=31, Row=30
+Routes/um: Hor=65.96, Ver=106.96
+Congestion smooth range: 2
+Overlap threshold: 0.0040
+
+--- Legend: [surrogate_vs_proxy] lines ---
+  sur_raw(wl,dh,cong)  Differentiable training surrogates (wirelength, density-hard, congestion).
+  px_raw(wl,den,cong)  PlacementCost evaluator sub-costs (same semantics as proxy breakdown).
+  pv                   Combined proxy cost (weighted sum used for scoring / best-checkpoint).
+  sur_n / px_n         Sub-costs normalized by epoch-0 baseline (see gradient.py logging).
+  gap_n(sur-px)        Normalized surrogate minus proxy gap per term (WL / density / congestion).
+  max_abs_gap          Which term has the largest |gap|; magnitude in parentheses.
+
+--- Raw checkpoint log (proxy_eval_interval=50) ---
+
+[surrogate_vs_proxy] epoch=49 sur_raw(wl,dh,cong)=(0.0612151,0.72974,1.84805) px_raw(wl,den,cong)=(0.0704597,0.72974,1.69939) pv=1.28503 sur_n=0.9964/0.9336/0.9854 px_n=0.9976/0.9336/0.9975 gap_n(sur-px)=-0.0012/-0.0000/-0.0121 max_abs_gap=congestion(0.0121)
+  # note: pv=1.28503; congestion surrogate slightly below proxy (gap -0.0121).
+
+[surrogate_vs_proxy] epoch=99 sur_raw(wl,dh,cong)=(0.0610977,0.689044,1.8296) px_raw(wl,den,cong)=(0.0704231,0.689044,1.69938) pv=1.26463 sur_n=0.9945/0.8815/0.9756 px_n=0.9971/0.8815/0.9975 gap_n(sur-px)=-0.0026/+0.0000/-0.0219 max_abs_gap=congestion(0.0219)
+  # pv down ~1.6% vs ep49; max_abs_gap still congestion.
+
+[surrogate_vs_proxy] epoch=149 sur_raw(wl,dh,cong)=(0.0610421,0.656573,1.80672) px_raw(wl,den,cong)=(0.0704554,0.656573,1.70132) pv=1.2494 sur_n=0.9936/0.8400/0.9634 px_n=0.9976/0.8400/0.9986 gap_n(sur-px)=-0.0040/+0.0000/-0.0352 max_abs_gap=congestion(0.0352)
+
+[surrogate_vs_proxy] epoch=199 sur_raw(wl,dh,cong)=(0.0610359,0.631985,1.791) px_raw(wl,den,cong)=(0.0704931,0.631985,1.69687) pv=1.23492 sur_n=0.9935/0.8085/0.9550 px_n=0.9981/0.8085/0.9960 gap_n(sur-px)=-0.0046/+0.0000/-0.0410 max_abs_gap=congestion(0.0410)
+
+[surrogate_vs_proxy] epoch=249 sur_raw(wl,dh,cong)=(0.0610383,0.61497,1.78312) px_raw(wl,den,cong)=(0.0705404,0.61497,1.69645) pv=1.22625 sur_n=0.9935/0.7868/0.9508 px_n=0.9988/0.7868/0.9958 gap_n(sur-px)=-0.0052/+0.0000/-0.0450 max_abs_gap=congestion(0.0450)
+
+[surrogate_vs_proxy] epoch=299 sur_raw(wl,dh,cong)=(0.0610586,0.602359,1.78259) px_raw(wl,den,cong)=(0.0706114,0.602358,1.69717) pv=1.22038 sur_n=0.9939/0.7706/0.9505 px_n=0.9998/0.7706/0.9962 gap_n(sur-px)=-0.0059/+0.0000/-0.0457 max_abs_gap=congestion(0.0457)
+
+[surrogate_vs_proxy] epoch=349 sur_raw(wl,dh,cong)=(0.0610813,0.591832,1.78482) px_raw(wl,den,cong)=(0.0706938,0.591832,1.69127) pv=1.21225 sur_n=0.9942/0.7572/0.9517 px_n=1.0009/0.7572/0.9927 gap_n(sur-px)=-0.0067/-0.0000/-0.0410 max_abs_gap=congestion(0.0410)
+
+[surrogate_vs_proxy] epoch=399 sur_raw(wl,dh,cong)=(0.0611107,0.58218,1.7852) px_raw(wl,den,cong)=(0.07078,0.582179,1.68458) pv=1.20416 sur_n=0.9947/0.7448/0.9519 px_n=1.0022/0.7448/0.9888 gap_n(sur-px)=-0.0074/-0.0000/-0.0369 max_abs_gap=congestion(0.0369)
+
+[surrogate_vs_proxy] epoch=449 sur_raw(wl,dh,cong)=(0.0611566,0.573134,1.78495) px_raw(wl,den,cong)=(0.0708764,0.573134,1.68374) pv=1.19931 sur_n=0.9955/0.7332/0.9518 px_n=1.0035/0.7332/0.9883 gap_n(sur-px)=-0.0081/-0.0000/-0.0365 max_abs_gap=congestion(0.0365)
+
+[surrogate_vs_proxy] epoch=499 sur_raw(wl,dh,cong)=(0.0612126,0.56542,1.769) px_raw(wl,den,cong)=(0.0709731,0.565419,1.68328) pv=1.19532 sur_n=0.9964/0.7234/0.9433 px_n=1.0049/0.7234/0.9880 gap_n(sur-px)=-0.0085/-0.0000/-0.0447 max_abs_gap=congestion(0.0447)
+
+[surrogate_vs_proxy] epoch=549 sur_raw(wl,dh,cong)=(0.0612614,0.559406,1.76441) px_raw(wl,den,cong)=(0.0710601,0.559406,1.68193) pv=1.19173 sur_n=0.9972/0.7157/0.9408 px_n=1.0061/0.7157/0.9872 gap_n(sur-px)=-0.0090/-0.0000/-0.0464 max_abs_gap=congestion(0.0464)
+
+[surrogate_vs_proxy] epoch=599 sur_raw(wl,dh,cong)=(0.0613187,0.555004,1.7647) px_raw(wl,den,cong)=(0.0711529,0.555004,1.68366) pv=1.19048 sur_n=0.9981/0.7100/0.9410 px_n=1.0074/0.7100/0.9882 gap_n(sur-px)=-0.0093/-0.0000/-0.0473 max_abs_gap=congestion(0.0473)
+
+[surrogate_vs_proxy] epoch=649 sur_raw(wl,dh,cong)=(0.0613691,0.551839,1.75286) px_raw(wl,den,cong)=(0.0712288,0.551839,1.68086) pv=1.18758 sur_n=0.9989/0.7060/0.9347 px_n=1.0085/0.7060/0.9866 gap_n(sur-px)=-0.0096/-0.0000/-0.0519 max_abs_gap=congestion(0.0519)
+
+[surrogate_vs_proxy] epoch=699 sur_raw(wl,dh,cong)=(0.0614228,0.548483,1.74714) px_raw(wl,den,cong)=(0.0713004,0.548482,1.68018) pv=1.18563 sur_n=0.9998/0.7017/0.9316 px_n=1.0095/0.7017/0.9862 gap_n(sur-px)=-0.0097/-0.0000/-0.0546 max_abs_gap=congestion(0.0546)
+
+[surrogate_vs_proxy] epoch=749 sur_raw(wl,dh,cong)=(0.0614721,0.546509,1.74345) px_raw(wl,den,cong)=(0.0713615,0.546509,1.68036) pv=1.1848 sur_n=1.0006/0.6992/0.9296 px_n=1.0104/0.6992/0.9863 gap_n(sur-px)=-0.0098/-0.0000/-0.0567 max_abs_gap=congestion(0.0567)
+
+[surrogate_vs_proxy] epoch=799 sur_raw(wl,dh,cong)=(0.0615282,0.544795,1.72838) px_raw(wl,den,cong)=(0.0714281,0.544795,1.68229) pv=1.18497 sur_n=1.0015/0.6970/0.9216 px_n=1.0113/0.6970/0.9874 gap_n(sur-px)=-0.0098/-0.0000/-0.0658 max_abs_gap=congestion(0.0658)
+  # note: pv ticks slightly up vs ep749 (1.1848 -> 1.18497); still in a flat region.
+
+[surrogate_vs_proxy] epoch=849 sur_raw(wl,dh,cong)=(0.0615826,0.543199,1.73325) px_raw(wl,den,cong)=(0.0714973,0.543199,1.67688) pv=1.18154 sur_n=1.0024/0.6949/0.9242 px_n=1.0123/0.6949/0.9843 gap_n(sur-px)=-0.0099/-0.0000/-0.0601 max_abs_gap=congestion(0.0601)
+  # pv best so far in this capture: 1.18154.
+
+[surrogate_vs_proxy] epoch=899 sur_raw(wl,dh,cong)=(0.0616277,0.541817,1.71826) px_raw(wl,den,cong)=(0.0715614,0.541817,1.68068) pv=1.18281 sur_n=1.0031/0.6932/0.9162 px_n=1.0132/0.6932/0.9865 gap_n(sur-px)=-0.0101/-0.0000/-0.0703 max_abs_gap=congestion(0.0703)
+  # final checkpoint: pv=1.18281 (slightly above ep849 best); returned placement follows
+  #   GradientPlacer best-proxy rule (best pv seen at any checkpoint, not necessarily last line).
+
+--- Final evaluate_benchmark summary (stdout) ---
+proxy_initial=1.313300  proxy_after_gradient=1.181538  delta_vs_initial before legalization=-10.03%  (wl=0.0715 den=0.5432 cong=1.6769)  overlaps=213  [2325.99s]
+
+Annotation:
+  proxy_initial          Starting layout (initial.plc) combined proxy.
+  proxy_after_gradient   Placement returned by the run after 900 epochs (best-by-proxy if enabled).
+  delta_vs_initial       ~-10% improvement vs start on combined proxy.
+  (wl, den, cong)        Final evaluator sub-costs after training.
+  overlaps=213           Overlap metric from compute_proxy_cost / overlap logic (high; layout still illegal by overlap count).
+  [2325.99s]             Wall time for placer.place() only (inside evaluate_benchmark), ~38.8 minutes.
+
+--- Trend summary ---
+  pv at checkpoints: 1.285 -> 1.1828 (monotonic improvement early; late training flattens / small wiggle).
+  Every line lists max_abs_gap on congestion: surrogate congestion tracks proxy but remains systematically lower
+  (negative gap on congestion), i.e. the differentiable congestion term is optimistic vs PlacementCost.
+
+================================================================================
+End of annotated log
+================================================================================

@@ -287,8 +287,28 @@ def _try_snap_one(
 
 
 class QPLegalizer:
-    def place(self, benchmark: Benchmark) -> torch.Tensor:
-        placement = benchmark.macro_positions.clone()
+    def place(
+        self,
+        benchmark: Benchmark,
+        *,
+        initial_macro_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Legalize hard macros; minimize squared displacement from the given centers.
+
+        If ``initial_macro_positions`` is set, it must match ``benchmark`` macro count /
+        dtype layout; otherwise ``benchmark.macro_positions`` is used as the QP anchor.
+
+        When unset, behavior matches the historical implementation:
+        ``placement = benchmark.macro_positions.clone()`` (no dtype/device coercion).
+        """
+        if initial_macro_positions is not None:
+            placement = initial_macro_positions.to(
+                device=benchmark.macro_positions.device,
+                dtype=benchmark.macro_positions.dtype,
+            ).clone()
+        else:
+            placement = benchmark.macro_positions.clone()
 
         n_hard = int(benchmark.num_hard_macros)
         if n_hard == 0:
@@ -302,7 +322,7 @@ class QPLegalizer:
         cell_h = ch / grid_rows
         bucket = max(cell_w, cell_h)
 
-        pos = benchmark.macro_positions[:n_hard].detach().cpu().numpy().astype(np.float64)
+        pos = placement[:n_hard].detach().cpu().numpy().astype(np.float64)
         sizes = benchmark.macro_sizes[:n_hard].detach().cpu().numpy().astype(np.float64)
         fixed = benchmark.macro_fixed[:n_hard].detach().cpu().numpy().astype(bool)
 

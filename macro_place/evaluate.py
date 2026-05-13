@@ -7,14 +7,28 @@ with baseline comparisons.
 Usage:
     uv run evaluate submissions/examples/greedy_row_placer.py
     uv run evaluate submissions/examples/greedy_row_placer.py --all
+    uv run evaluate submissions/examples/greedy_row_placer.py --all --no-isolate-all
     uv run evaluate submissions/examples/greedy_row_placer.py -b ibm03
+
+By default each run saves a placement overview PNG under ``vis/<benchmark>.png``.
+Pass ``--no-vis`` to skip that I/O.
+
+With ``--all``, each benchmark runs in a **fresh subprocess** by default so CUDA state
+does not carry between designs (avoids crashes that appear only on long multi-run
+sessions). Set ``MACRO_PLACE_EVAL_ALL_IN_PROCESS=1`` or pass ``--no-isolate-all`` to
+restore the legacy single-process sweep (and optional end summary table).
 """
 
 import argparse
+import gc
 import importlib.util
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
+
+import torch
 
 from macro_place.benchmark import Benchmark
 from macro_place.loader import load_benchmark, load_benchmark_from_dir
@@ -207,13 +221,13 @@ def _print_summary_table(results):
     print("-" * 96)
     if has_baselines:
         print(
-            f"{'Benchmark':>13}  {'Proxy':>8}  {'Initial':>8}  {'Δ%':>7}"
+            f"{'Benchmark':>13}  {'Proxy':>8}  {'Initial':>8}  {'delta%':>7}"
             f"  {'SA':>8}  {'RePlAce':>8}"
             f"  {'vs SA':>8}  {'vs RePlAce':>10}  {'Overlaps':>8}"
         )
     else:
         print(
-            f"{'Benchmark':>13}  {'Proxy':>8}  {'Initial':>8}  {'Δ%':>7}"
+            f"{'Benchmark':>13}  {'Proxy':>8}  {'Initial':>8}  {'delta%':>7}"
             f"  {'WL':>8}  {'Density':>8}"
             f"  {'Congestion':>10}  {'Overlaps':>8}"
         )
@@ -284,6 +298,29 @@ def _print_summary_table(results):
     print()
 
 
+def _cuda_between_benchmark_runs() -> None:
+    """Best-effort GPU cleanup when running many benchmarks in one process (e.g. ``--all``).
+
+    Reduces spurious follow-on ``cudaErrorUnknown`` / illegal-access reports after long
+    CUDA phases; safe no-ops when CUDA is unavailable.
+    """
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    gc.collect()
+
+
 # ── CLI entry point ──────────────────────────────────────────────────────────
 
 
@@ -315,9 +352,16 @@ def main():
         help="Run on NG45 commercial designs (ariane133, ariane136, mempool_tile, nvdla).",
     )
     parser.add_argument(
-        "--vis",
+        "--no-vis",
         action="store_true",
-        help="Visualize each placement after evaluation (saves to vis/<benchmark>.png).",
+        help="Skip saving placement PNGs to vis/<benchmark>.png (default is to save them).",
+    )
+    parser.add_argument(
+        "--no-isolate-all",
+        action="store_true",
+        help="With --all, run every benchmark in the **same** process (legacy). "
+        "Default is one subprocess per benchmark so CUDA state resets — avoids errors "
+        "that only appear after long multi-benchmark runs.",
     )
     args = parser.parse_args()
 
@@ -328,10 +372,7 @@ def main():
         print("Run: git submodule update --init external/MacroPlacement")
         sys.exit(1)
 
-    # ── load placer ──────────────────────────────────────────────────────
     placer_path = Path(args.placer)
-    placer = _load_placer(placer_path)
-    placer_name = type(placer).__name__
 
     # ── determine which benchmarks to run ────────────────────────────────
     if args.ng45:
@@ -341,11 +382,59 @@ def main():
     else:
         benchmarks_to_run = [args.benchmark or "ibm01"]
 
+    # ── --all: fresh interpreter per benchmark (recommended for CUDA stability) ──
+    isolate_all = (
+        args.all
+        and len(benchmarks_to_run) > 1
+        and not args.no_isolate_all
+        and os.environ.get("MACRO_PLACE_EVAL_ALL_IN_PROCESS", "").strip().lower()
+        not in ("1", "true", "yes", "on")
+    )
+    if isolate_all:
+        env = os.environ.copy()
+        env["MACRO_PLACE_EVAL_CHILD"] = "1"
+        placer_abs = str(placer_path.resolve())
+        cwd = Path.cwd()
+        rc_max = 0
+        print(
+            "evaluate · --all · one subprocess per benchmark (clean CUDA context). "
+            "Use --no-isolate-all to run in a single process.",
+            flush=True,
+        )
+        print()
+        for name in benchmarks_to_run:
+            cmd = [
+                sys.executable,
+                "-m",
+                "macro_place.evaluate",
+                placer_abs,
+                "-b",
+                name,
+            ]
+            if args.ng45:
+                cmd.append("--ng45")
+            if args.no_vis:
+                cmd.append("--no-vis")
+            r = subprocess.run(cmd, env=env, cwd=cwd)
+            rc_max = max(rc_max, int(r.returncode))
+        sys.exit(rc_max)
+
+    # ── load placer (single-process path) ────────────────────────────────
+    placer = _load_placer(placer_path)
+    placer_name = type(placer).__name__
+
     # ── run ──────────────────────────────────────────────────────────────
-    print("=" * 80)
-    print(f"evaluate · {placer_name}  ({placer_path})")
-    print("=" * 80)
-    print()
+    show_banner = os.environ.get("MACRO_PLACE_EVAL_CHILD", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if show_banner:
+        print("=" * 80)
+        print(f"evaluate · {placer_name}  ({placer_path})")
+        print("=" * 80)
+        print()
 
     results = []
     for name in benchmarks_to_run:
@@ -363,12 +452,14 @@ def main():
         dp = result["proxy_cost"]
         dlt = _proxy_delta_pct(dpi, dp)
         print(
-            f"proxy={dp:.4f}  initial={dpi:.4f}  Δ={dlt:+.2f}%  "
+            f"proxy={dp:.4f}  initial={dpi:.4f}  delta={dlt:+.2f}%  "
             f"(wl={result['wirelength']:.3f} den={result['density']:.3f} cong={result['congestion']:.3f})  "
             f"{status}  [{result['runtime']:.2f}s]"
         )
 
-        if args.vis:
+        _cuda_between_benchmark_runs()
+
+        if not args.no_vis:
             vis_dir = Path("vis")
             vis_dir.mkdir(exist_ok=True)
             save_path = str(vis_dir / f"{name}.png")

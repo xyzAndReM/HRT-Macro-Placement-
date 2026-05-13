@@ -144,9 +144,9 @@ uv run evaluate submissions/examples/greedy_row_placer.py --all
 # Run on NG45 commercial designs (ariane133, ariane136, mempool_tile, nvdla)
 uv run evaluate submissions/examples/greedy_row_placer.py --ng45
 
-# Visualize the result
-uv run evaluate submissions/examples/greedy_row_placer.py --vis
-uv run evaluate submissions/examples/greedy_row_placer.py --all --vis
+# Placement overview PNGs are saved by default under vis/<benchmark>.png; skip with --no-vis
+uv run evaluate submissions/examples/greedy_row_placer.py --no-vis
+uv run evaluate submissions/examples/greedy_row_placer.py --all --no-vis
 ```
 
 Running on all benchmarks produces a summary like:

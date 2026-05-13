@@ -24,10 +24,14 @@ _original_get_grid_cell_location = PlacementCost._PlacementCost__get_grid_cell_l
 
 def _patched_get_grid_cell_location(self, x_pos, y_pos):
     """Fixed version with bounds clamping."""
+    xf, yf = float(x_pos), float(y_pos)
+    if not (math.isfinite(xf) and math.isfinite(yf)):
+        # Degenerate fallback — avoids ``math.floor(nan)`` when upstream placement diverged.
+        return 0, 0
     self.grid_width = float(self.width / self.grid_col)
     self.grid_height = float(self.height / self.grid_row)
-    row = math.floor(y_pos / self.grid_height)
-    col = math.floor(x_pos / self.grid_width)
+    row = math.floor(yf / self.grid_height)
+    col = math.floor(xf / self.grid_width)
 
     # Clamp to valid range to fix boundary bug
     row = max(0, min(row, self.grid_row - 1))

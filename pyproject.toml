@@ -27,7 +27,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
 ]
 
-# Torch from cu126 (CUDA 12.6 wheels include Pascal); cu128 default builds do not.
+# Torch from cu128 (CUDA 12.8). Required for Blackwell (sm_120), e.g. RTX 5070/5080/5090.
+# Older cu126 wheels only bundle kernels through sm_90 → "no kernel image" on sm_120.
 dependencies = [
     "torch>=2.0.0",
     "numpy>=1.20.0",
@@ -69,11 +70,11 @@ line-length = 100
 target-version = ["py38", "py39", "py310", "py311", "py312"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu126" }
+torch = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.pytest.ini_options]
