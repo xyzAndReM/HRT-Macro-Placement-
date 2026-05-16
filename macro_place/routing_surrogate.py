@@ -2,11 +2,11 @@
 PLC-aligned routing congestion.
 
 * ``plc_routing_surrogate_scalar`` — soft, differentiable star-L routes on macro
-  centers (for gradient training).
-* ``plc_routing_surrogate_discrete_pins`` — **evaluator-quality** congestion on
-  ICCAD-style benchmarks: pin grid cells, same 2-/3-pin/decompose rules and
-  routing weights as ``plc_client_os.get_routing``, PLC macro overlap with
-  partial-edge corrections, then smooth + ABU(0.05) like ``get_congestion_cost``.
+  centers (GPU-batched).
+* ``plc_routing_surrogate_scalar_pins`` — pin offsets on hard macros, batched L-routes,
+  PLC-aligned route weights (GPU; no per-net Python loop).
+* ``plc_routing_surrogate_discrete_pins`` — evaluator-quality discrete pin routing
+  (CPU-oriented); smooth + ABU(0.05) like ``get_congestion_cost``.
 """
 
 from __future__ import annotations
@@ -151,6 +151,43 @@ def _macro_blockage_raw(
     return h_macro, v_macro
 
 
+def _collect_l_route_segments_batched(
+    combined_pos: torch.Tensor,
+    net_idx: torch.Tensor,
+    net_mask: torch.Tensor,
+    net_weights: torch.Tensor,
+    net_valid: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    GPU-vectorized star L-routes (driver pin 0 -> each sink). ``net_idx`` rows index
+    ``combined_pos`` (macros + ports); shape ``[num_nets, max_pins]``.
+    """
+    device, dtype = combined_pos.device, combined_pos.dtype
+    n_nodes = int(combined_pos.shape[0])
+    if net_idx.ndim != 2 or net_idx.shape[1] < 2:
+        z = torch.zeros(0, device=device, dtype=dtype)
+        return z, z, z, z, z
+
+    idx_safe = net_idx.clamp(0, max(n_nodes - 1, 0))
+    pins = combined_pos[idx_safe]
+    x = pins[..., 0]
+    y = pins[..., 1]
+
+    n_seg = int(net_idx.shape[1]) - 1
+    sx = x[:, 0:1].expand(-1, n_seg)
+    sy = y[:, 0:1].expand(-1, n_seg)
+    tx = x[:, 1:]
+    ty = y[:, 1:]
+
+    seg_mask = net_mask[:, 0:1] & net_mask[:, 1:] & net_valid.unsqueeze(1)
+    if not torch.any(seg_mask):
+        z = torch.zeros(0, device=device, dtype=dtype)
+        return z, z, z, z, z
+
+    w = net_weights.unsqueeze(1).expand(-1, n_seg)
+    return sx[seg_mask], sy[seg_mask], tx[seg_mask], ty[seg_mask], w[seg_mask]
+
+
 def _collect_l_route_segments(
     combined_pos: torch.Tensor,
     net_idx: torch.Tensor,
@@ -220,6 +257,224 @@ def _collect_l_route_segments(
     ty = torch.stack(ty_list)
     w_seg = torch.stack(w_list)
     return sx, sy, tx, ty, w_seg
+
+
+def _pin_positions_from_owners(
+    combined_pos: torch.Tensor,
+    owners: torch.Tensor,
+    slots: torch.Tensor,
+    *,
+    n_hard: int,
+    macro_pin_offsets: list,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Absolute pin coordinates (hard-macro offsets applied)."""
+    n_nodes = int(combined_pos.shape[0])
+    owners = owners.long().clamp(0, max(n_nodes - 1, 0))
+    slots = slots.long()
+    px = combined_pos[owners, 0]
+    py = combined_pos[owners, 1]
+    if n_hard <= 0:
+        return px, py
+
+    hard_m = owners < int(n_hard)
+    if not torch.any(hard_m):
+        return px, py
+
+    px = px.clone()
+    py = py.clone()
+    ho = owners[hard_m]
+    hs = slots[hard_m]
+    ox = torch.zeros((ho.shape[0],), device=combined_pos.device, dtype=dtype)
+    oy = torch.zeros((ho.shape[0],), device=combined_pos.device, dtype=dtype)
+    for mi in range(int(n_hard)):
+        m = ho == mi
+        if not torch.any(m):
+            continue
+        offs = macro_pin_offsets[mi].to(device=combined_pos.device, dtype=dtype)
+        if offs.numel() == 0:
+            continue
+        sl = hs[m].clamp(min=0, max=max(int(offs.shape[0]) - 1, 0)).long()
+        sel = offs[sl]
+        ox[m] = sel[:, 0]
+        oy[m] = sel[:, 1]
+    px[hard_m] = px[hard_m] + ox
+    py[hard_m] = py[hard_m] + oy
+    return px, py
+
+
+def _pin_xy_from_pin_net_idx(
+    combined_pos: torch.Tensor,
+    pin_net_idx: torch.Tensor,
+    *,
+    n_hard: int,
+    macro_pin_offsets: list,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pin absolute coordinates for all nets; shapes ``[num_nets, max_pins]``."""
+    n_nodes = int(combined_pos.shape[0])
+    owners = pin_net_idx[..., 0].clamp(0, max(n_nodes - 1, 0))
+    slots = pin_net_idx[..., 1].long()
+    base = combined_pos[owners]
+    px = base[..., 0]
+    py = base[..., 1]
+    if n_hard <= 0:
+        return px, py
+
+    hard = owners < int(n_hard)
+    if not torch.any(hard):
+        return px, py
+
+    px = px.clone()
+    py = py.clone()
+    ox = torch.zeros_like(px)
+    oy = torch.zeros_like(py)
+    for mi in range(int(n_hard)):
+        m = hard & (owners == mi)
+        if not torch.any(m):
+            continue
+        offs = macro_pin_offsets[mi].to(device=combined_pos.device, dtype=combined_pos.dtype)
+        if offs.numel() == 0:
+            continue
+        sl = slots[m].clamp(min=0, max=max(int(offs.shape[0]) - 1, 0)).long()
+        sel = offs[sl]
+        ox[m] = sel[:, 0]
+        oy[m] = sel[:, 1]
+    px = px + ox
+    py = py + oy
+    return px, py
+
+
+def _routing_weights_pin_batched(
+    benchmark: "Benchmark",
+    pin_net_idx: torch.Tensor,
+    net_valid: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Per-net route weights aligned with ``PlacementCost.get_routing`` (vectorized)."""
+    num_nets = int(pin_net_idx.shape[0])
+    n_macros = int(benchmark.num_macros)
+    if benchmark.net_driver_weights is not None:
+        gw = benchmark.net_driver_weights.to(device=device, dtype=dtype)
+    else:
+        gw = benchmark.net_weights.to(device=device, dtype=dtype)
+    gw = gw[:num_nets]
+    owners0 = pin_net_idx[:, 0, 0]
+    port_drv = owners0 >= n_macros
+    w = torch.where(port_drv | (gw <= 1.0), torch.ones_like(gw), gw)
+    w = w.clamp(min=1e-6)
+    return w * net_valid.to(dtype)
+
+
+def _collect_l_route_segments_pin_batched(
+    px: torch.Tensor,
+    py: torch.Tensor,
+    pin_net_mask: torch.Tensor,
+    net_weights: torch.Tensor,
+    net_valid: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Star L-routes from pin 0 using batched pin coordinates."""
+    device, dtype = px.device, px.dtype
+    if px.ndim != 2 or px.shape[1] < 2:
+        z = torch.zeros(0, device=device, dtype=dtype)
+        return z, z, z, z, z
+
+    n_seg = int(px.shape[1]) - 1
+    sx = px[:, 0:1].expand(-1, n_seg)
+    sy = py[:, 0:1].expand(-1, n_seg)
+    tx = px[:, 1:]
+    ty = py[:, 1:]
+    seg_mask = pin_net_mask[:, 0:1] & pin_net_mask[:, 1:] & net_valid.unsqueeze(1)
+    if not torch.any(seg_mask):
+        z = torch.zeros(0, device=device, dtype=dtype)
+        return z, z, z, z, z
+    w = net_weights.unsqueeze(1).expand(-1, n_seg)
+    return sx[seg_mask], sy[seg_mask], tx[seg_mask], ty[seg_mask], w[seg_mask]
+
+
+def _routing_weight_scalar(
+    benchmark: "Benchmark",
+    net_k: int,
+    first_owner: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Per-net route weight aligned with ``_discrete_net_routing_grids``."""
+    n_macros = int(benchmark.num_macros)
+    w_src = (
+        benchmark.net_driver_weights
+        if benchmark.net_driver_weights is not None
+        else benchmark.net_weights
+    )
+    gw = float(w_src[net_k].item())
+    if int(first_owner) >= n_macros:
+        w = 1.0
+    else:
+        w = 1.0 if gw <= 1.0 else gw
+    return torch.tensor(max(w, 1e-6), device=device, dtype=dtype)
+
+
+def _collect_l_route_segments_pins(
+    combined_pos: torch.Tensor,
+    pin_net_idx: torch.Tensor,
+    pin_net_mask: torch.Tensor,
+    net_valid: torch.Tensor,
+    benchmark: "Benchmark",
+    *,
+    n_hard: int,
+    macro_pin_offsets: list,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Star L-routes from driver pin (pin 0) using true pin coordinates."""
+    num_nets = int(pin_net_idx.shape[0])
+    sx_list: List[torch.Tensor] = []
+    sy_list: List[torch.Tensor] = []
+    tx_list: List[torch.Tensor] = []
+    ty_list: List[torch.Tensor] = []
+    w_list: List[torch.Tensor] = []
+
+    for k in range(num_nets):
+        if not net_valid[k]:
+            continue
+        m = pin_net_mask[k]
+        pins = pin_net_idx[k][m]
+        pn = int(pins.shape[0])
+        if pn < 2:
+            continue
+        owners = pins[:, 0]
+        slots = pins[:, 1]
+        pins_x, pins_y = _pin_positions_from_owners(
+            combined_pos,
+            owners,
+            slots,
+            n_hard=n_hard,
+            macro_pin_offsets=macro_pin_offsets,
+            dtype=dtype,
+        )
+        w = _routing_weight_scalar(
+            benchmark, k, int(owners[0].item()), device, dtype
+        )
+        sx0 = pins_x[0]
+        sy0 = pins_y[0]
+        for j in range(1, pn):
+            sx_list.append(sx0)
+            sy_list.append(sy0)
+            tx_list.append(pins_x[j])
+            ty_list.append(pins_y[j])
+            w_list.append(w)
+
+    if not sx_list:
+        z = torch.zeros(0, device=device, dtype=dtype)
+        return z, z, z, z, z
+
+    return (
+        torch.stack(sx_list),
+        torch.stack(sy_list),
+        torch.stack(tx_list),
+        torch.stack(ty_list),
+        torch.stack(w_list),
+    )
 
 
 def _apply_l_route_segments_vectorized(
@@ -710,15 +965,12 @@ def plc_routing_surrogate_scalar(
     H_net = torch.zeros(nr, nc, device=device, dtype=dtype)
     V_net = torch.zeros(nr, nc, device=device, dtype=dtype)
 
-    sx, sy, tx, ty, w_seg = _collect_l_route_segments(
+    sx, sy, tx, ty, w_seg = _collect_l_route_segments_batched(
         combined_pos,
         net_idx,
         net_mask,
         net_weights,
         net_valid,
-        benchmark,
-        device,
-        dtype,
     )
     _apply_l_route_segments_vectorized(
         H_net,
@@ -759,5 +1011,96 @@ def plc_routing_surrogate_scalar(
     H_tot = H_net + h_blk
     V_tot = V_net + v_blk
 
+    both = torch.cat([V_tot.reshape(-1), H_tot.reshape(-1)])
+    return _abu_top_mean(both, float(abu_frac))
+
+
+def plc_routing_surrogate_scalar_pins(
+    combined_pos: torch.Tensor,
+    pin_net_idx: torch.Tensor,
+    pin_net_mask: torch.Tensor,
+    net_valid: torch.Tensor,
+    full_macro_pos: torch.Tensor,
+    benchmark: "Benchmark",
+    *,
+    smooth_range: Optional[int] = None,
+    abu_frac: float = 0.05,
+    nr: Optional[int] = None,
+    nc: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Differentiable congestion with **pin** L-routes (offsets on hard macros), same
+    normalize → smooth → macro blockage → ABU reduction as ``plc_routing_surrogate_scalar``.
+    """
+    device = combined_pos.device
+    dtype = combined_pos.dtype
+    cw = float(benchmark.canvas_width)
+    ch = float(benchmark.canvas_height)
+    nr = max(int(benchmark.grid_rows), 1) if nr is None else max(int(nr), 1)
+    nc = max(int(benchmark.grid_cols), 1) if nc is None else max(int(nc), 1)
+    cell_w = cw / nc
+    cell_h = ch / nr
+
+    sr = int(benchmark.congestion_smooth_range) if smooth_range is None else int(smooth_range)
+
+    grid_h_routes, grid_v_routes = grid_routing_capacities(benchmark, nr=nr, nc=nc)
+    gh = torch.tensor(max(grid_h_routes, 1e-30), device=device, dtype=dtype)
+    gv = torch.tensor(max(grid_v_routes, 1e-30), device=device, dtype=dtype)
+
+    h_ma = float(benchmark.hrouting_alloc)
+    v_ma = float(benchmark.vrouting_alloc)
+    n_hard = int(benchmark.num_hard_macros)
+
+    H_net = torch.zeros(nr, nc, device=device, dtype=dtype)
+    V_net = torch.zeros(nr, nc, device=device, dtype=dtype)
+
+    px, py = _pin_xy_from_pin_net_idx(
+        combined_pos,
+        pin_net_idx,
+        n_hard=n_hard,
+        macro_pin_offsets=benchmark.macro_pin_offsets,
+    )
+    w_net = _routing_weights_pin_batched(
+        benchmark, pin_net_idx, net_valid, device, dtype
+    )
+    sx, sy, tx, ty, w_seg = _collect_l_route_segments_pin_batched(
+        px, py, pin_net_mask, w_net, net_valid
+    )
+    _apply_l_route_segments_vectorized(
+        H_net,
+        V_net,
+        sx,
+        sy,
+        tx,
+        ty,
+        w_seg,
+        nr,
+        nc,
+        cell_w,
+        cell_h,
+        device,
+        dtype,
+    )
+
+    H_net = H_net / gh
+    V_net = V_net / gv
+    H_net, V_net = smooth_routing_cong_plc(H_net, V_net, sr)
+
+    h_blk, v_blk = _macro_blockage_raw(
+        full_macro_pos,
+        benchmark,
+        nr,
+        nc,
+        cw,
+        ch,
+        n_hard,
+        h_ma,
+        v_ma,
+    )
+    h_blk = h_blk / gh
+    v_blk = v_blk / gv
+
+    H_tot = H_net + h_blk
+    V_tot = V_net + v_blk
     both = torch.cat([V_tot.reshape(-1), H_tot.reshape(-1)])
     return _abu_top_mean(both, float(abu_frac))

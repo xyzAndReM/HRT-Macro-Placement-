@@ -97,3 +97,84 @@ Date: 2026-05-04 (local). Purpose: handoff after sleep + performance direction.
 ---
 
 *End of RECORD — add dated sections below for future sessions.*
+
+---
+
+## 2026-05-15 — `GpuPlacer`: online congestion scale (`_fit_scale_cong`)
+
+**Problem:** With pin L-route surrogate, PLC **`px_cong`** is often below GPU **`sur_cong`**; WL/density calibrate each proxy check, but congestion was long fixed at **`w_cong_run = 1`**, overweighting congestion vs true proxy.
+
+### v1 (same day, superseded)
+
+- **`_fit_scale_cong`**: blend slope + level, **30/70** momentum vs previous weight, clamp **`[0.2, 5.0]`**.
+- **Observation (ibm01 logs):** **`w_cong`** oscillated (~**0.61 ↔ 0.97**) every few checkpoints — slope across 50-epoch gaps too noisy.
+
+### v2 (current)
+
+- **`_fit_scale_cong`**: **EMA only** on the level ratio **`px_cong / sur_cong`**:  
+  `new = (1-α)·ema + α·level` with **`α = 0.15`**, then clamp **`[0.5, 1.5]`**.
+- Separate state **`ema_w_cong`** (init **1.0**) per `place()` run; **`w_cong_run = ema_w_cong`** after each proxy check when **`affine_calibrate`**.
+- Rationale: **`px/sur`** ~**0.81–0.83** stable on ibm01-like runs; no slope term; tighter clamp matches “~18% overestimate” band and avoids zeroing congestion.
+
+**Unchanged:** Liquid phase has **`MACRO_PLACE_GPU_PROXY_CHECK_EVERY=0`** — no congestion calib there.
+
+---
+
+## 2026-05-13 — `LiquidPlacer` / `GpuPlacer` congestion surrogate & proxy calibration
+
+**Focus:** ibm02 liquid→patience cycles; align GPU congestion surrogate with PLC proxy without killing GPU throughput.
+
+### Congestion surrogate path (evolution)
+
+1. **Started** with pin L-route Python loop (`plc_routing_surrogate_scalar_pins`) — accurate-ish but **~1 min/epoch** on ibm02 (per-net `.item()` + Python loop). **Reverted default to RUDY.**
+2. **BBox RUDY** (`_rudy_demand_grid`) — fast but **~2× low** vs PLC (~1.2 vs ~2.4 on ibm02); poor proxy tracking.
+3. **GPU-batched macro-center L-routes** (`_collect_l_route_segments_batched` + `plc_routing_surrogate_scalar`) — same PLC-style H/V deposit + smooth + blockage + top-5% mean; still macro centers.
+4. **GPU-batched pin-aware L-routes** (final default when `net_pin_nodes` complete):
+   - `_pin_xy_from_pin_net_idx`, `_routing_weights_pin_batched`, `_collect_l_route_segments_pin_batched`
+   - `plc_routing_surrogate_scalar_pins` rewritten to use batched path (no per-net Python loop)
+   - Raw surrogate scale **~2.1–2.6** vs PLC **~1.97–2.33** (≈8–15% gap vs old 2× gap)
+   - Env: `MACRO_PLACE_GPU_PIN_CONG=0` → macro L-routes; `MACRO_PLACE_GPU_USE_BBOX_RUDY=1` → legacy RUDY
+
+### Proxy logging & patience (`liquid.py` + `gpu/placer.py`)
+
+- **`surrogate_vs_proxy`** + **`scale_calib`** every **`MACRO_PLACE_LIQUID_PROXY_CHECK_EVERY`** (default **50**)
+- **Stagnation:** require **5 consecutive** sub-threshold proxy checks (`MACRO_PLACE_LIQUID_STAGNATION_PATIENCE=5`) before stop (not 1)
+- Liquid phase: no proxy checks; patience: `affine_calibrate=True`
+
+### Scale calibration (`w` only, no `k`)
+
+- Removed intercept **`k`** — loss uses **`w * surrogate`** only; proxy coeffs **1.0 / 0.5 / 0.5** applied in loss sum
+- **`_fit_scale_surrogate_to_proxy`**: fit WL/density `w`; target `w*sur ≈ px` (raw PLC subcost)
+- **2026-05-14:** congestion scale was fixed at **`w_cong = 1`** (pin surrogate near PLC scale; two-point `w` was unstable).
+- **2026-05-15 (patience `affine_calibrate`):** congestion **`_fit_scale_cong`** — **v2:** EMA on **`px/sur`** (`α=0.15`, clamp **0.5–1.5**); **v1** (blend+slope, clamp 0.2–5) dropped after oscillation in logs. See section **2026-05-15** above.
+
+### Observations (ibm02)
+
+- Pin L-route + `w=1` on cong: surrogate and PLC congestion **trend down together**; proxy improved ~1.51 → ~1.33 over long patience runs
+- WL/density track PLC well; congestion raw gap much smaller than RUDY era
+- Remaining gap: surrogate sometimes **over**-estimates PLC slightly; shape mismatch when PLC drops faster than surrogate
+
+### Files touched
+
+| Path | Changes |
+|------|---------|
+| `submissions/gpu/placer.py` | Congestion modes; scale calib; **`_fit_scale_cong`** for `w_cong_run` when `affine_calibrate`; logging; stagnation |
+| `submissions/liquid.py` | Cycle schedule docs; stagnation patience 5; proxy every 50 |
+| `macro_place/routing_surrogate.py` | Batched L-route segment collectors; vectorized pin congestion |
+
+### Env quick reference
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MACRO_PLACE_GPU_USE_RUDY_CONG` | `1` | GPU congestion on (not PLC CPU checks) |
+| `MACRO_PLACE_GPU_PIN_CONG` | `1` | Pin L-routes when pin tables exist |
+| `MACRO_PLACE_GPU_USE_BBOX_RUDY` | `0` | `1` = legacy bbox RUDY |
+| `MACRO_PLACE_LIQUID_PROXY_CHECK_EVERY` | `50` | Proxy log + calib interval |
+| `MACRO_PLACE_LIQUID_STAGNATION_PATIENCE` | `5` | Consecutive bad proxy checks before stop |
+
+### Possible next steps (not done)
+
+- Soft differentiable ABU instead of hard `topk` mean
+- Clamp WL-only calib or single-point `w=px/sur` with narrow band for WL
+- Vectorized pin offsets already in; further PLC alignment may need route-weight / 3-pin rules
+

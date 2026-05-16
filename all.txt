@@ -1,0 +1,204 @@
+# all.txt — last captured terminal session (evaluate / liquid.py --all style run)
+
+Source: C:\Users\fabio\.cursor\projects\c-Users-fabio-AndreHRT\terminals\4.txt
+Collected: 2026-05-15 (workspace snapshot)
+
+NOTE: The terminal file begins mid-output (scrollback truncated). The explicit
+command line (e.g. `uv run evaluate ... --all`) is not present in the capture.
+What follows is the verbatim remainder of that session.
+
+ERRATA (verified read of full snapshot):
+  - `terminals/4.txt` is **146 lines total** (only file under `terminals/`).
+  - There is **no** `ibm01`, `ibm02`, … `ibm17` text and **no** harness lines
+    `proxy=... initial=... VALID` in that file — only a fragment + **ibm18**.
+  - Your local PowerShell window may still show ibm01+; Cursor’s persisted
+    terminal buffer often **drops the head** of long `--all` runs. Re-capture
+    with e.g. `... --all 2>&1 | Tee-Object -FilePath all_run.log`.
+
+================================================================================
+VERBATIM TERMINAL CAPTURE (terminals/4.txt, body only — YAML header omitted)
+================================================================================
+
+  surrogate_total: 1.562  vs_proxy: +0.07239  (0.5*wl + 0.5*den + 0.5*cong after w scaling)
+  term        sur      plc    err      w     note
+  wl         0.0412    0.0591 +0.005845  1.576
+  den        0.5103    0.5103 -3.614e-06      1
+  cong        2.484     2.351  +0.1331      1 <- largest gap
+Traceback (most recent call last):
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\submissions\gpu\placer.py", line 1446, in place
+    full = _run_on_device(device)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\submissions\gpu\placer.py", line 1220, in _run_on_device
+    loss.backward()
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\.venv\Lib\site-packages\torch\_tensor.py", line 631, in backward
+    torch.autograd.backward(
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\.venv\Lib\site-packages\torch\autograd\__init__.py", line 381, in backward
+    _engine_run_backward(
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\.venv\Lib\site-packages\torch\autograd\graph.py", line 869, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run backward
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\macro_place\evaluate.py", line 473, in <module> 
+    main()
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\macro_place\evaluate.py", line 443, in main     
+    result = evaluate_benchmark(placer, name, str(testcase_root), ng45_dir=ng45_dir)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\macro_place\evaluate.py", line 186, in evaluate_benchmark
+    placement = placer.place(benchmark)
+                ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\submissions\liquid.py", line 242, in place      
+    pos = gpu_patience.place(benchmark, initial_macro_positions=pos)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\submissions\gpu\placer.py", line 1468, in place 
+    raise RuntimeError(
+RuntimeError: [gpu_placer] CUDA failure that is not a clear out-of-memory condition; not falling back to CPU (the GPU context is often poisoned, and copying parameters to CPU usually hits the same error). Start a fresh process, try MACRO_PLACE_GPU_DENSITY_CHUNK smaller, CUDA_LAUNCH_BLOCKING=1 once to localize, or set MACRO_PLACE_GPU_CUDA_FALLBACK=0 to skip this message path. Original: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+W0514 23:18:19.951000 13004 .venv\Lib\site-packages\torch\utils\flop_counter.py:29] triton not found; flop counting will not work for triton kernels
+  ibm18... #[INFO] Reading from external\MacroPlacement\Testcases\ICCAD04/ibm18\netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 55, Row: 39
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+#[INFO] Reading from C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\external\MacroPlacement\Testcases\ICCAD04\ibm18\netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 55, Row: 39
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+[liquid] cycles_cap=1 liquid_epochs=50 liquid_lr=0.01 liquid_w_density=0.8 liquid_w_overlap=0.5 (w_wl=1.0 w_cong=0.5 shared with patience) patience_epochs=20000 stagnation_min_abs=0.0005 stagnation_patience=2 proxy_check_every=50 plc_gate=on
+[liquid] cycle 1/1 start proxy=1.78987
+[liquid] cycle 1/1 phase=liquid epochs=50 lr=0.01 w_density=0.8 w_overlap=0.5 (w_wl=1.0 w_cong=0.5)
+[gpu_placer] optimizer=Adam lr=0.01
+#[INFO] Reading from C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\external\MacroPlacement\Testcases\ICCAD04\ibm18\netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 55, Row: 39
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+[gpu_placer] epoch=1/50 loss=1.91951 wl=0.0363876 den=1.03801 cong=2.62911 ovl=0.306723 device=cuda bins=39x55
+[gpu_placer] epoch=50/50 loss=1.73753 wl=0.0376059 den=0.761294 cong=2.62205 ovl=0.168763 device=cuda bins=39x55
+[gpu_placer] surrogate loss plot saved to C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\vis\ibm18_gpu_surrogate_loss_vs_epoch.png
+[liquid] cycle 1/1 phase=patience epochs_cap=20000 stagnation_min_abs=0.0005 stagnation_patience=2 proxy_check_every=50
+[gpu_placer] optimizer=Adam lr=0.02
+#[INFO] Reading from C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\external\MacroPlacement\Testcases\ICCAD04\ibm18\netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 55, Row: 39
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+[gpu_placer] epoch=1/20000 loss=1.70772 wl=0.0376059 den=0.761294 cong=2.62205 ovl=0.168763 device=cuda bins=39x55
+[gpu_placer] proxy_check epoch=1
+  proxy: 1.674  (start 1.674, last n/a, total +0, best 1.674)
+  surrogate_total: 1.747  vs_proxy: +0.07294  (0.5*wl + 0.5*den + 0.5*cong after w scaling)
+  term        sur      plc    err      w     note
+  wl        0.03761    0.0556       +0  1.478
+  den        0.7613    0.7613       +0      1
+  cong        2.622     2.476  +0.1459      1 <- largest gap
+[gpu_placer] epoch=50/20000 loss=1.74458 wl=0.039599 den=0.606777 cong=2.60045 ovl=0.0824234 device=cuda bins=39x55
+[gpu_placer] proxy_check epoch=50
+  proxy: 1.619  (start 1.674, last -0.05518, total -0.05518, best 1.619)
+  surrogate_total: 1.671  vs_proxy: +0.05218  (0.5*wl + 0.5*den + 0.5*cong after w scaling)
+  term        sur      plc    err      w     note
+  wl         0.0396   0.05901 +0.00871   1.71
+  den        0.6068    0.6068 -8.17e-07      1
+  cong          2.6     2.514 +0.08695      1 <- largest gap
+Traceback (most recent call last):
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\submissions\gpu\placer.py", line 1446, in place
+    full = _run_on_device(device)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\submissions\gpu\placer.py", line 1086, in _run_on_device
+    pin_flat = _pin_positions_for_hpwl(
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\submissions\gpu\placer.py", line 394, in _pin_positions_for_hpwl
+    slots = hs[m].clamp(min=0, max=max(int(offs.shape[0]) - 1, 0)).long()
+            ~~^^^
+torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\macro_place\evaluate.py", line 473, in <module> 
+    main()
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\macro_place\evaluate.py", line 443, in main     
+    result = evaluate_benchmark(placer, name, str(testcase_root), ng45_dir=ng45_dir)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\macro_place\evaluate.py", line 186, in evaluate_benchmark
+    placement = placer.place(benchmark)
+                ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\submissions\liquid.py", line 242, in place      
+    pos = gpu_patience.place(benchmark, initial_macro_positions=pos)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\fabio\AndreHRT\HRT-Macro-Placement-\submissions\gpu\placer.py", line 1468, in place 
+    raise RuntimeError(
+RuntimeError: [gpu_placer] CUDA failure that is not a clear out-of-memory condition; not falling back to CPU (the GPU context is often poisoned, and copying parameters to CPU usually hits the same error). Start a fresh process, try MACRO_PLACE_GPU_DENSITY_CHUNK smaller, CUDA_LAUNCH_BLOCKING=1 once to localize, or set MACRO_PLACE_GPU_CUDA_FALLBACK=0 to skip this message path. Original: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+PS C:\Users\fabio\AndreHRT\HRT-Macro-Placement-> 
+
+================================================================================
+SUMMARY (parsed)
+================================================================================
+
+Benchmark where the run ends in the capture: **ibm18** (ICCAD04).
+
+Two CUDA failures appear in the capture (may be one failed run + automatic
+retry, or overlapping sessions):
+
+1) **loss.backward()** inside `_run_on_device` (gpu/placer.py ~1220) — illegal
+   memory access; surfaced as GpuPlacer refusing non-OOM CUDA fallback.
+
+2) **ibm18 patience phase** — after proxy_check at epoch **50**, next training
+   step failed in **`_pin_positions_for_hpwl`** (gpu/placer.py ~394) during
+   indexing `hs[m]` — illegal memory access (often async; true fault may be
+   earlier kernel).
+
+Harness **final** lines (`proxy=... initial=... VALID`) for benchmarks *before*
+ibm18 are **not** in this terminal file (truncated). Only ibm18 partial PLC
+checkpoints are recoverable here.
+
+--------------------------------------------------------------------------------
+PLC proxy_cost values recorded BEFORE the ibm18 crash (from log + csv tail)
+--------------------------------------------------------------------------------
+
+| When | px_proxy (PLC total) | Notes |
+|------|----------------------|-------|
+| Cycle start (pre-liquid) | **1.78987** | `[liquid] cycle 1/1 start proxy=` |
+| Patience proxy_check epoch 1 | **1.674** | Rounded in console; CSV 1.674327612 |
+| Patience proxy_check epoch 50 | **1.619** | Rounded in console; CSV 1.619147897 |
+
+No further PLC `proxy_cost` after epoch 50 — crash before epoch 100 check.
+
+Last two rows appended to `gpu_proxycheck.csv` for this patience segment:
+
+  epoch=1,  px_proxy=1.674327612
+  epoch=50, px_proxy=1.619147897
+
+(Orphan lines at the very top of the terminal capture show a proxy_check table
+fragment without `[gpu_placer] proxy_check epoch=...`; the PLC **proxy:** line is
+missing — not included in the proxy table above.)

@@ -3,12 +3,12 @@ Hybrid placer: **GpuPlacer** (DreamPlace-inspired) until PLC proxy stagnates, th
 **ExploreMultiplePlacer** (parallel ``ExplorePlacer`` runs, best-of by fast proxy)
 for a fixed number of epochs per seed population.
 
-Default schedule (``MACRO_PLACE_PE_OUTER_ROUNDS=8`` — **eight** outer cycles, then final GPU):
+Default schedule (``MACRO_PLACE_PE_OUTER_ROUNDS=1`` — **one** outer cycle, then final GPU):
 
   Per cycle:
   1. **GPU** until stagnation (PLC min-abs **0.0001** between proxy checks every **100** epochs).
   2. **Explore** — **25** epochs per seed, single wave, **10** seeds, soft movable macros only.
-  3. **Liquid GPU** — fixed **50** epochs, ``w_overlap=0``, ``w_density=0.8`` (no PLC stagnation early-stop).
+  3. **Liquid GPU** — fixed **50** epochs; same ``w_wl`` / ``w_cong`` as patience; only ``w_density=0.8``, ``w_overlap=0.5`` for exploration.
 
   After all cycles:
   4. **Final GPU** until stagnation (min-abs **0.0001**, env ``MACRO_PLACE_PE_FINAL_GPU_STAGNATION_MIN_ABS_IMPROVEMENT``).
@@ -66,8 +66,9 @@ from submissions.gpu.placer import GpuPlacer  # noqa: E402
 _PLACE_EXPLORE_EPOCHS = 25
 # Liquid GPU pass after each explore (fixed epoch budget, no stagnation stop).
 _PLACE_LIQUID_GPU_EPOCHS = 50
+_PLACE_LIQUID_LR = 1e-2
 _PLACE_LIQUID_W_DENSITY = 0.8
-_PLACE_LIQUID_W_OVERLAP = 0.0
+_PLACE_LIQUID_W_OVERLAP = 0.5
 
 
 def _cuda_reset_between_phases() -> None:
@@ -178,9 +179,9 @@ class PlaceExplorePlacer:
     Ends with Abbacus hard-macro legalization; overlap pair count is printed at exit.
 
     Env:
-        MACRO_PLACE_PE_OUTER_ROUNDS — default ``8`` (outer cycles: gpu → explore → liquid gpu)
+        MACRO_PLACE_PE_OUTER_ROUNDS — default ``1`` (outer cycles: gpu → explore → liquid gpu)
         Explore phase: fixed **25** epochs per seed, single wave, soft movable macros only.
-        Liquid GPU per cycle: fixed **50** epochs, ``w_overlap=0``, ``w_density=0.8``, no stagnation.
+        Liquid GPU per cycle: fixed **50** epochs; ``w_wl``/``w_cong`` match patience; explore via ``w_density=0.8``, ``w_overlap=0.5`` only.
         MACRO_PLACE_PE_EXPLORE_VERBOSE — default **on** (unset or ``1``): print ``ExploreMultiplePlacer``
             per-wave and summary lines. Set ``0`` / ``false`` / ``off`` for quiet parallel explore.
         MACRO_PLACE_PE_EXPLORE_WORKER_USE_CUDA — if ``1``, explore pool workers do **not**
@@ -218,7 +219,7 @@ class PlaceExplorePlacer:
         self.outer_rounds = int(
             outer_rounds
             if outer_rounds is not None
-            else (os.environ.get("MACRO_PLACE_PE_OUTER_ROUNDS", "8") or "8")
+            else (os.environ.get("MACRO_PLACE_PE_OUTER_ROUNDS", "1") or "1")
         )
         self.explore_epochs = _PLACE_EXPLORE_EPOCHS
         self.explore_seed = int(explore_seed)
@@ -256,7 +257,8 @@ class PlaceExplorePlacer:
 
         print(
             f"[place_explore] outer_rounds={self.outer_rounds} explore_epochs={self.explore_epochs} "
-            f"liquid_gpu_epochs={_PLACE_LIQUID_GPU_EPOCHS} liquid_w_density={_PLACE_LIQUID_W_DENSITY} "
+            f"liquid_gpu_epochs={_PLACE_LIQUID_GPU_EPOCHS} liquid_lr={_PLACE_LIQUID_LR:g} "
+            f"liquid_w_density={_PLACE_LIQUID_W_DENSITY} "
             f"liquid_w_overlap={_PLACE_LIQUID_W_OVERLAP} "
             f"gpu_max_epochs={self.gpu_max_epochs} inner_gpu_plc_min_abs=0.0001 "
             f"stagnation_patience={self.stagnation_patience} "
@@ -351,11 +353,12 @@ class PlaceExplorePlacer:
                 px_ex,
             )
 
-            # --- Liquid GPU (fixed epochs, no overlap penalty, higher density weight) ---
+            # --- Liquid GPU (fixed epochs, reduced density weight) ---
             gpu_liquid = GpuPlacer(
                 epochs=_PLACE_LIQUID_GPU_EPOCHS,
-                w_overlap=_PLACE_LIQUID_W_OVERLAP,
+                lr=_PLACE_LIQUID_LR,
                 w_density=_PLACE_LIQUID_W_DENSITY,
+                w_overlap=_PLACE_LIQUID_W_OVERLAP,
                 stagnation_proxy_patience=0,
                 stagnation_min_abs_improvement=0.0,
                 seed=self.explore_seed + cycle * 10_000 + 5_000,

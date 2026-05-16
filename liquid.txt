@@ -1,0 +1,95 @@
+# LiquidPlacer benchmark log (annotated)
+
+## liquid.py — ibm02 — strong proxy vs initial (2026-05-14)
+
+### Command
+
+```text
+uv run evaluate submissions/liquid.py -b ibm02
+```
+
+### Harness result (evaluate summary)
+
+```text
+[liquid] completed 1 cycle(s)
+proxy=1.2553  initial=1.5658  delta=-19.83%  (wl=0.103 den=0.504 cong=1.800)  VALID  [2105.65s]
+Saved visualization to vis\ibm02.png
+```
+
+### Config (defaults used)
+
+| Setting | Value |
+|---------|-------|
+| `MACRO_PLACE_LIQUID_CYCLES` | 1 |
+| Liquid GPU epochs | 50 (`lr=0.01`, `w_density=0.8`, `w_overlap=0.5`) |
+| Patience GPU epochs cap | 20000 (`lr=0.02`, `w_wl=1.0`, `w_cong=0.5`) |
+| Proxy check interval | 50 |
+| Stagnation | `min_abs=0.0005`, `patience=5` consecutive checks |
+| Congestion surrogate | Pin-aware GPU L-routes (default) |
+| Congestion scale | `w_cong = 1` (fixed; WL/density still scale-calibrated) |
+| Post-process | Abbacus legalization |
+| PLC cycle gate | on (revert if proxy worsens vs cycle start; 1 cycle so N/A) |
+
+### Proxy timeline
+
+| Stage | PLC `proxy_cost` | Notes |
+|-------|------------------|-------|
+| Initial placement | **1.5658** | Harness baseline (pre-liquid) |
+| Cycle 1 start | **1.56585** | Snapshot before liquid+patience |
+| After liquid (50 ep) | (not logged at cycle boundary) | Surrogate cong ~2.58–2.65 in liquid phase |
+| Patience epoch 1 check | **~1.504** | First proxy checkpoint after liquid handoff |
+| Patience epoch 1350 check | **~1.285** | Running best in mid-run logs |
+| Patience stop (epoch 2450) | **1.252** | Stagnation 5/5; best in phase **1.24526** |
+| Cycle 1 end (pre-Abbacus) | **1.252** | `delta_vs_cycle_start = -0.314` |
+| **Final (post-Abbacus)** | **1.2553** | Harness report; +0.003 vs pre-legalize |
+
+**Net vs initial:** 1.5658 → 1.2553 (**−0.3105**, **−19.83%** relative). Lower is better.
+
+### Sub-costs (final harness report)
+
+| Term | Final | Initial (ibm02 default) | Δ |
+|------|------:|------------------------:|----:|
+| Wirelength | 0.103 | 0.092 | +0.011 |
+| Density | 0.504 | 0.500 | +0.004 |
+| Congestion | **1.800** | **2.337** | **−0.537** |
+
+Initial sub-costs from same harness baseline as `place_explore` ibm02 (`initial=1.5658`).
+
+Congestion dominated the proxy gain: initial cong ~2.3+ → final **1.80**.
+
+### Patience training (GPU phase)
+
+- **Epochs completed:** 2450 / 20000 (stopped early by stagnation, not epoch cap).
+- **Exit reason:** 5 consecutive proxy checks without ≥0.0005 improvement vs global best.
+- **Last checkpoint:** epoch 2450, `pv=1.252`, stagnation `best=1.24526`.
+- **Proxy trend (patience):** ~1.50 at epoch 1 → ~1.25 at stop (~17% drop over patience).
+- **Surrogate vs PLC (epoch 2450):** raw cong sur **1.889** vs plc **1.797** (~+5% gap); WL scaled with `w≈1.05`.
+
+### Wall time
+
+| | Seconds | Minutes |
+|--|--------:|--------:|
+| Total evaluate | 2105.65 | ~35.1 |
+
+### Artifacts
+
+- `vis/ibm02.png` — placement visualization
+- `vis/ibm02_gpu_proxy_vs_epoch.png` — PLC proxy vs epoch (patience)
+- `vis/ibm02_gpu_surrogate_loss_vs_epoch.png` — surrogate loss vs epoch
+- `gpu_proxycheck.csv` — append-only proxy checkpoint CSV (if enabled)
+
+### Validation
+
+- Harness status: **VALID**
+- Overlap metrics: not quoted in summary line (see evaluate overlap output if logged).
+
+### Comparison (same repo, other placers on ibm02)
+
+| Placer | Proxy | Δ vs 1.5658 | Wall time |
+|--------|------:|------------:|----------:|
+| **liquid.py (this run)** | **1.2553** | **−19.83%** | ~35 min |
+| place_explore.py (prior log) | 1.5101 | −3.56% | ~55 min |
+
+---
+
+*Add new dated sections below for future liquid.py runs.*

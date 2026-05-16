@@ -1,7 +1,72 @@
-# `submissions/gradient.py` — session notes
+# Session notes — gradient + GPU proxy calibration
 
-Working file: `submissions/gradient.py`.
-Eval harness: `uv run evaluate submissions/gradient.py -b ibm01`.
+Working files: `submissions/gradient.py`, `submissions/gpu/placer.py` (patience / liquid).
+Eval: `uv run evaluate submissions/gradient.py -b ibm01` or `uv run evaluate submissions/liquid.py -b ibm01`.
+
+## 2026-05-15 — `GpuPlacer` affine scale: WL EMA (after congestion EMA v2)
+
+**Problem:** After congestion moved to `_fit_scale_cong` (level EMA, `α=0.15`), `w_wl` became
+the noisiest calibrated term. Slope-based `_fit_scale_surrogate_to_proxy` made `w_wl` oscillate
+(e.g. 1.079 → 1.399 → 1.519 → 1.079) while the true `px_wl / sur_wl` ratio drifts slowly
+(~1.071→1.080 over 1000 epochs on ibm01).
+
+**Change (`submissions/gpu/placer.py`):**
+- Added **`_fit_scale_wl`**: EMA on **`px_wl / sur_wl`**, `alpha=0.20`, clamp **`[0.5, 3.0]`**
+  (faster than congestion because WL ratio is cleaner).
+- State **`ema_w_wl`**, initialized to constructor **`w_wl`**.
+- Patience **`affine_calibrate`** block: WL uses EMA; congestion unchanged; **density** still
+  uses `_fit_scale_surrogate_to_proxy` (harmless — `w_den` stays ~1.0 when surrogate matches PLC).
+
+**Expect:** `w_wl` converges in ~5 proxy checks without spikes; `err_wl` should stay small
+(<~0.002) once settled. Congestion EMA unchanged (`_fit_scale_cong`, `α=0.15`, clamp 0.5–1.5).
+
+---
+
+## 2026-05-15 — `LiquidPlacer` / ibm02 baseline log (explore `w_density=0.8`, `w_overlap=0.5`)
+
+Annotated harness excerpt (`evaluate submissions/liquid.py -b ibm02`), **2 cycles**, explore density/overlap as noted (defaults before explore weights moved to 0.5 / 0.5):
+
+| Field | Value |
+| --- | --- |
+| Final proxy | **1.1983** (harness line; stagnation stop saw **1.19769** at last PLC check) |
+| Initial proxy | **1.5658** |
+| Δ vs initial | **-23.47%** |
+| Subcosts (reported) | wl **0.108**, den **0.501**, cong **1.680** |
+| Legal | **VALID** (post-Abbacus) |
+| Wall-clock | **~2698 s** (~45 min) |
+| Cycle 2 PLC gate | `delta_vs_cycle_start` **-0.0494** (improved vs cycle start; gate OK) |
+| Patience exit | PLC stagnation **4/4** consecutive checks with improvement **&lt; 0.0001** vs best (`best≈1.19371`, `current≈1.19769` — slight drift above best at stop) |
+| Artifacts | `vis/ibm02_gpu_proxy_vs_epoch.png`, `vis/ibm02_gpu_surrogate_loss_vs_epoch.png`, `logs/liquid_ibm02_congestion.md`, `vis/ibm02.png` |
+
+**Takeaway:** Large proxy gain vs initialization with legal placement; patience stopped on tight **1e-4** stagnation while proxy briefly sat above session best (~**0.3%** relative overshoot).
+
+---
+
+## 2026-05-15 — `LiquidPlacer` current defaults vs previous ibm02 run (reference)
+
+**Previous logged run** (ibm02, `evaluate submissions/liquid.py -b ibm02`, ~2698 s, VALID, proxy **1.198** from **1.566**):
+
+| Knob | Previous execution | **Current** (`submissions/liquid.py` defaults) |
+| --- | --- | --- |
+| Cycles | **2** | **2** |
+| Explore `w_density` | **0.8** | **0.8** |
+| Explore `w_overlap` | **0.5** | **0.5** |
+| Explore `lr` | **1e-2** | **1e-2** |
+| Patience `lr` | **0.02** (GpuPlacer default) | **0.02** (GpuPlacer default) |
+| Explore stop | surrogate plateau `0.001×` initial, patience **3**, every **50** | same |
+| Patience stop | PLC `0.0001` min improve, patience **4**, every **50** | same |
+| Patience `w_density` / `w_overlap` | **0.5** / **1.0** (GpuPlacer defaults) | unchanged |
+| `w_wl` / `w_cong` (both phases) | **1.0** / **0.5** | unchanged |
+
+**Also in codebase (not liquid schedule):** Abbacus fallback default `max(5000, 25×n_hard)`, `alpha=0.3`, post-fallback cooperative 50/50 GS sweep; WL/cong EMA calibration in patience (`_fit_scale_wl`, `_fit_scale_cong`).
+
+Use this table when comparing the next ibm02 (or `--all`) run to the annotated baseline above.
+
+**2026-05-15 update:** `liquid.py` defaults reverted to match the **Previous execution** column (2 cycles, explore cap **20000**, explore `0.8`/`0.5`/`1e-2`, patience stagnation **4** vs **best**, `lr` = GpuPlacer default `0.02`).
+
+---
+
+## `submissions/gradient.py` (earlier session)
 
 ## What changed today
 
