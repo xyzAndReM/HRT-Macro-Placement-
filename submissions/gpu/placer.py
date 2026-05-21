@@ -21,8 +21,9 @@ Training curves under ``vis/``:
 Set ``MACRO_PLACE_GPU_TRAINING_PLOT=0`` to skip all figures.
 
 Proxy-check console logging:
-    ``MACRO_PLACE_GPU_PROXY_LOG`` — ``compact`` (default): structured multi-line report;
-    ``legacy``: old ``scale_calib`` + ``surrogate_vs_proxy`` one-liners; ``off``: CSV only.
+    ``MACRO_PLACE_GPU_PROXY_LOG`` — default ``off``; ``compact`` / ``legacy`` for console reports.
+    ``MACRO_PLACE_GPU_VERBOSE=1`` — epoch logs, proxy reports, plot messages (default quiet).
+    ``MACRO_PLACE_GPU_TRAINING_PLOT`` — default ``0`` (set ``1`` for PNG curves).
 
 Optimizer (movable macro positions):
     ``MACRO_PLACE_GPU_OPTIMIZER`` — ``adam`` (default) for ``torch.optim.Adam``, or
@@ -35,6 +36,10 @@ Surrogate early-stop (no PLC required):
     sets the threshold to ``rel × loss`` at the first check of the phase (overrides fixed min-abs).
 
 PLC proxy early-stop (when ``PlacementCost`` loads):
+    ``late_stagnation_sgd_switch`` (constructor, default off) — when enabled with abs stagnation,
+    at ``patience - 1`` consecutive sub-threshold checks switch Adam to plain SGD
+    (``MACRO_PLACE_GPU_SGD_LR_RATIO``, default ``0.2`` × Adam lr)
+    and reset the streak. ``liquid.py`` patience phase sets this on.
     ``MACRO_PLACE_GPU_STAGNATION_MIN_ABS_IMPROVEMENT`` — if **> 0** (default ``0.01``),
     after each PLC proxy check (every ``MACRO_PLACE_GPU_PROXY_CHECK_EVERY`` epochs,
     default ``100``), stop only after ``MACRO_PLACE_GPU_STAGNATION_PATIENCE`` consecutive
@@ -80,6 +85,9 @@ Congestion surrogate:
     ``net_pin_nodes`` is complete (hard-macro pin offsets + PLC route weights), else macro-center
     L-routes. ``MACRO_PLACE_GPU_USE_BBOX_RUDY=1`` — legacy uniform bbox RUDY.
     ``MACRO_PLACE_GPU_PIN_CONG=0`` — macro-center L-routes even when pin tables exist.
+    ``MACRO_PLACE_GPU_PLC_NET_ROUTING=1`` (default): after each proxy check, use PLC net routing
+    grids (total minus macro blockage) plus differentiable ``_macro_blockage_raw`` instead of
+    L-route net demand until the next check; L-route fallback before the first check.
 
 Surrogate form (per term): fit ``w * surrogate ≈ proxy_subcost`` (no offset ``k``). Proxy weights
 ``1.0 / 0.5 / 0.5`` apply when summing into ``loss``. Patience ``affine_calibrate=True`` sets
@@ -88,6 +96,14 @@ level-only EMA (``_fit_scale_wl``: ``px_wl/sur_wl``, ``alpha=0.20``, clamp **0.5
 ``_fit_scale_cong``: ``px_cong/sur_cong``, ``alpha=0.15``, clamp **0.5–1.5**).
 Density uses ``_fit_scale_surrogate_to_proxy`` unless ``affine_calibrate_density=False``, which keeps
 ``w_den_run`` fixed while still fitting WL/congestion when ``affine_calibrate=True``.
+
+Spatial congestion hotspot loss (patience / ``affine_calibrate=True`` only):
+    ``MACRO_PLACE_GPU_SPATIAL_CONG`` — default ``1``: weight surrogate congestion in PLC
+    overloaded bins (EMA hotspot map from ``get_*_routing_congestion`` after proxy checks).
+    ``MACRO_PLACE_GPU_HOTSPOT_ALPHA`` — EMA blend for hotspot map (default ``0.3``).
+    ``MACRO_PLACE_GPU_HOTSPOT_SCALE`` — multiplier on spatial term vs scalar ABU cong (default ``0.1``).
+    ``MACRO_PLACE_GPU_HOTSPOT_MIN_EPOCH`` — first displayed epoch for hotspot map/loss (default ``200``).
+    ``MACRO_PLACE_GPU_HOTSPOT_H_WEIGHT`` / ``_V_WEIGHT`` — H vs V excess in PLC hotspot map (default ``2.0`` / ``1.0``).
 """
 
 from __future__ import annotations
@@ -108,6 +124,8 @@ from torch import nn
 from macro_place.benchmark import Benchmark
 from macro_place.routing_surrogate import (
     grid_routing_capacities,
+    plc_routing_surrogate_hv_totals,
+    plc_routing_surrogate_hv_totals_pins,
     plc_routing_surrogate_scalar,
     plc_routing_surrogate_scalar_pins,
     smooth_routing_cong_plc,
@@ -537,7 +555,7 @@ def _pin_positions_for_hpwl(
 
 
 def _training_plots_enabled() -> bool:
-    return os.environ.get("MACRO_PLACE_GPU_TRAINING_PLOT", "1").strip().lower() not in (
+    return os.environ.get("MACRO_PLACE_GPU_TRAINING_PLOT", "0").strip().lower() not in (
         "0",
         "false",
         "no",
@@ -557,7 +575,7 @@ def _save_proxy_vs_epoch_plot(name: str, epochs: list[int], proxies: list[float]
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print("[gpu_placer] matplotlib missing; skip proxy vs epoch plot", flush=True)
+        _gpu_log("[gpu_placer] matplotlib missing; skip proxy vs epoch plot", flush=True)
         return False
 
     vis = _ROOT / "vis"
@@ -572,7 +590,7 @@ def _save_proxy_vs_epoch_plot(name: str, epochs: list[int], proxies: list[float]
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"[gpu_placer] proxy vs epoch plot saved to {out.resolve()}", flush=True)
+    _gpu_log(f"[gpu_placer] proxy vs epoch plot saved to {out.resolve()}", flush=True)
     return True
 
 
@@ -588,7 +606,7 @@ def _save_surrogate_loss_vs_epoch_plot(name: str, epochs: list[int], losses: lis
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print("[gpu_placer] matplotlib missing; skip surrogate loss plot", flush=True)
+        _gpu_log("[gpu_placer] matplotlib missing; skip surrogate loss plot", flush=True)
         return False
 
     vis = _ROOT / "vis"
@@ -603,7 +621,7 @@ def _save_surrogate_loss_vs_epoch_plot(name: str, epochs: list[int], losses: lis
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"[gpu_placer] surrogate loss plot saved to {out.resolve()}", flush=True)
+    _gpu_log(f"[gpu_placer] surrogate loss plot saved to {out.resolve()}", flush=True)
     return True
 
 
@@ -615,6 +633,8 @@ def _report_training_plots(
     saved_proxy: bool,
     saved_surr: bool,
 ) -> None:
+    if not _gpu_placer_verbose():
+        return
     if saved_proxy or saved_surr:
         return
     parts: list[str] = []
@@ -626,10 +646,9 @@ def _report_training_plots(
         parts.append("log_every is 0 (no surrogate samples)")
     if not parts:
         parts.append("matplotlib missing, MACRO_PLACE_GPU_TRAINING_PLOT=0, or no data")
-    print(
+    _gpu_log(
         f"[gpu_placer] no training plot saved ({'; '.join(parts)}). "
-        "Install matplotlib or fix ICC paths; surrogate PNG uses log_every>0.",
-        flush=True,
+        "Install matplotlib or fix ICC paths; surrogate PNG uses log_every>0."
     )
 
 
@@ -646,18 +665,24 @@ def _make_gpu_optimizer(params: list[nn.Parameter], lr: float) -> torch.optim.Op
             weight_decay=0.0,
             nesterov=True,
         )
-        print(
-            f"[gpu_placer] optimizer=SGD+Nesterov lr={lr:g} momentum={mom:g}",
-            flush=True,
-        )
+        _gpu_log(f"[gpu_placer] optimizer=SGD+Nesterov lr={lr:g} momentum={mom:g}")
         return opt
     if kind not in ("adam", ""):
-        print(
-            f"[gpu_placer] unknown MACRO_PLACE_GPU_OPTIMIZER={kind!r}; using Adam",
-            flush=True,
-        )
-    print(f"[gpu_placer] optimizer=Adam lr={lr:g}", flush=True)
+        _gpu_log(f"[gpu_placer] unknown MACRO_PLACE_GPU_OPTIMIZER={kind!r}; using Adam")
+    _gpu_log(f"[gpu_placer] optimizer=Adam lr={lr:g}")
     return torch.optim.Adam(params, lr=lr)
+
+
+def _switch_to_sgd(
+    params: list[nn.Parameter],
+    lr_sgd: float,
+) -> torch.optim.Optimizer:
+    """Replace Adam with pure SGD (no momentum) for late-stage refinement."""
+    _gpu_log(
+        f"[gpu_placer] optimizer switch: Adam -> SGD lr={lr_sgd:g} "
+        "(late-stage refinement, no momentum)"
+    )
+    return torch.optim.SGD(params, lr=lr_sgd, momentum=0.0, nesterov=False)
 
 
 def _cuda_teardown_after_training() -> None:
@@ -770,8 +795,63 @@ _PROXY_DEN_COEF = 0.5
 _PROXY_CONG_COEF = 0.5
 
 
+def _gpu_placer_verbose() -> bool:
+    """Default quiet; set ``MACRO_PLACE_GPU_VERBOSE=1`` for training/proxy console logs."""
+    return os.environ.get("MACRO_PLACE_GPU_VERBOSE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _gpu_log(msg: str) -> None:
+    if _gpu_placer_verbose():
+        print(msg, flush=True)
+
+
+def _gpu_final_summary_enabled() -> bool:
+    if _gpu_placer_verbose():
+        return False
+    if os.environ.get("MACRO_PLACE_EVAL_QUIET", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False
+    raw = (os.environ.get("MACRO_PLACE_GPU_FINAL_SUMMARY") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _gpu_print_final_summary(
+    *,
+    benchmark: Benchmark,
+    full: torch.Tensor,
+    plc,
+    elapsed: float,
+    epochs: int,
+) -> None:
+    if not _gpu_final_summary_enabled():
+        return
+    if plc is not None:
+        with torch.no_grad():
+            costs = compute_proxy_cost(
+                full.detach().to(device="cpu", dtype=torch.float32),
+                benchmark,
+                plc,
+            )
+        px = float(costs["proxy_cost"])
+        print(
+            f"[gpu_placer] proxy={px:.6g} elapsed={elapsed:.1f}s epochs={epochs}",
+            flush=True,
+        )
+    else:
+        print(f"[gpu_placer] elapsed={elapsed:.1f}s epochs={epochs}", flush=True)
+
+
 def _proxy_log_mode() -> str:
-    raw = (os.environ.get("MACRO_PLACE_GPU_PROXY_LOG") or "compact").strip().lower()
+    raw = (os.environ.get("MACRO_PLACE_GPU_PROXY_LOG") or "off").strip().lower()
     if raw in ("compact", "legacy", "off"):
         return raw
     return "compact"
@@ -836,7 +916,7 @@ def _print_proxy_check_report(
     start_s = f"{px_proxy_start:.4g}" if px_proxy_start is not None else "n/a"
     best_s = f"{px_proxy_best:.4g}" if px_proxy_best is not None else "n/a"
 
-    print(f"[gpu_placer] proxy_check epoch={epoch}", flush=True)
+    _gpu_log(f"[gpu_placer] proxy_check epoch={epoch}", flush=True)
     print(
         f"  proxy: {px_proxy:.4g}  (start {start_s}, last {d_last_s}, "
         f"total {d_start_s}, best {best_s})",
@@ -889,7 +969,7 @@ class _CudaSectionTimer:
             self.totals[name] += float(ev0.elapsed_time(ev1))
 
     def report(self, epochs_completed: int) -> None:
-        if not self.enabled or not self.totals:
+        if not _gpu_placer_verbose() or not self.enabled or not self.totals:
             return
         n = max(1, int(epochs_completed))
         print(
@@ -944,6 +1024,10 @@ class GpuPlacer:
         stagnation_surrogate_min_rel_initial: float | None = None,
         surrogate_stagnation_check_every: int | None = None,
         w_density_schedule: Callable[[int], float] | None = None,
+        restore_best_proxy_placement: bool | None = None,
+        late_stagnation_sgd_switch: bool = False,
+        use_spatial_cong: bool | None = None,
+        use_plc_net_routing: bool | None = None,
     ) -> None:
         self.epochs = int(epochs) if epochs is not None else int(
             os.environ.get("MACRO_PLACE_GPU_EPOCHS", "5000")
@@ -1012,6 +1096,29 @@ class GpuPlacer:
         self.seed = int(seed)
         self.log_every = int(log_every)
         self._w_density_schedule = w_density_schedule
+        if restore_best_proxy_placement is None:
+            restore_best_proxy_placement = self.stagnation_min_abs_improvement > 0.0
+        self.restore_best_proxy_placement = bool(restore_best_proxy_placement)
+        self.late_stagnation_sgd_switch = bool(late_stagnation_sgd_switch)
+        if use_spatial_cong is None:
+            use_spatial_cong = (
+                os.environ.get("MACRO_PLACE_GPU_SPATIAL_CONG", "1") or "1"
+            ).strip().lower() not in ("0", "false", "no", "off")
+        self.use_spatial_cong = bool(use_spatial_cong)
+        if use_plc_net_routing is None:
+            use_plc_net_routing = (
+                os.environ.get("MACRO_PLACE_GPU_PLC_NET_ROUTING", "1") or "1"
+            ).strip().lower() not in ("0", "false", "no", "off")
+        self.use_plc_net_routing = bool(use_plc_net_routing)
+        self._hotspot_map_alpha = float(
+            os.environ.get("MACRO_PLACE_GPU_HOTSPOT_ALPHA", "0.3") or "0.3"
+        )
+        self._hotspot_scale = float(
+            os.environ.get("MACRO_PLACE_GPU_HOTSPOT_SCALE", "0.1") or "0.1"
+        )
+        self._hotspot_min_epoch = int(
+            os.environ.get("MACRO_PLACE_GPU_HOTSPOT_MIN_EPOCH", "200") or "200"
+        )
 
     def place(
         self,
@@ -1022,6 +1129,7 @@ class GpuPlacer:
         epoch_display_base: int = 0,
         epoch_display_cap: int | None = None,
         plc_proxy_include_epoch_zero: bool = True,
+        on_proxy_check: Callable[..., None] | None = None,
     ) -> torch.Tensor:
         """If ``telemetry`` is a dict, it is filled with ``epochs_completed`` (int) and
         ``wall_seconds`` (float) for the differentiable training loop only (``_run_on_device``,
@@ -1209,7 +1317,17 @@ class GpuPlacer:
         log_path = Path(os.environ.get("MACRO_PLACE_GPU_LOG_PATH", "gpu_proxycheck.csv"))
         log_fp = None
         proxy_log_mode = _proxy_log_mode()
-        if plc is not None and proxy_check_every > 0:
+        proxy_csv = os.environ.get("MACRO_PLACE_GPU_PROXY_CSV", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if (
+            plc is not None
+            and proxy_check_every > 0
+            and (proxy_csv or _gpu_placer_verbose())
+        ):
             log_fp = open(log_path, "a", encoding="utf-8")
             if log_fp.tell() == 0:
                 log_fp.write(
@@ -1235,6 +1353,7 @@ class GpuPlacer:
         _plc_proxy_e0 = bool(plc_proxy_include_epoch_zero)
 
         def _run_on_device(run_device: torch.device) -> torch.Tensor:
+            nonlocal opt
             nonlocal ports
             nonlocal net_idx_macro, net_mask_macro, net_weights_macro, net_valid_macro
             nonlocal net_idx_pin_cong, net_mask_pin_cong, net_valid_pin_cong
@@ -1296,6 +1415,13 @@ class GpuPlacer:
 
             stag_best: float | None = None
             stag_streak = 0
+            switched_to_sgd = False
+            _stag_patience_cap = (
+                max(1, int(self.stagnation_proxy_patience))
+                if self.stagnation_proxy_patience > 0
+                else 1
+            )
+            stagnation_switch_threshold = max(1, _stag_patience_cap - 1)
             surr_stag_best: float | None = None
             surr_stag_streak = 0
             surr_stag_min_abs: float | None = None
@@ -1309,6 +1435,10 @@ class GpuPlacer:
             px_proxy_start: float | None = None
             px_proxy_prev: float | None = None
             px_proxy_best: float | None = None
+            best_proxy_restore: float | None = None
+            best_hard_restore: torch.Tensor | None = None
+            best_soft_restore: torch.Tensor | None = None
+            _restore_best = bool(self.restore_best_proxy_placement)
 
             w_wl_run = float(self.w_wl)
             w_den_run = float(self.w_density)
@@ -1319,6 +1449,36 @@ class GpuPlacer:
             ema_w_wl = float(self.w_wl)
             w_ovl_run = float(self.w_overlap)
             affine_prev: dict[str, float] | None = None
+
+            _spatial_cong_env = (
+                os.environ.get("MACRO_PLACE_GPU_SPATIAL_CONG", "1") or "1"
+            ).strip().lower()
+            _use_spatial_cong = self.use_spatial_cong and _spatial_cong_env not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+            _hotspot_h_weight = float(
+                os.environ.get("MACRO_PLACE_GPU_HOTSPOT_H_WEIGHT", "2.0") or "2.0"
+            )
+            _hotspot_v_weight = float(
+                os.environ.get("MACRO_PLACE_GPU_HOTSPOT_V_WEIGHT", "1.0") or "1.0"
+            )
+            _hotspot_map: torch.Tensor | None = None
+            _hotspot_min_epoch = int(self._hotspot_min_epoch)
+
+            plc_net_h: torch.Tensor | None = None
+            plc_net_v: torch.Tensor | None = None
+            _plc_net_env = (
+                os.environ.get("MACRO_PLACE_GPU_PLC_NET_ROUTING", "1") or "1"
+            ).strip().lower() not in ("0", "false", "no", "off")
+            _use_plc_net_routing = (
+                self.use_plc_net_routing
+                and _plc_net_env
+                and use_rudy_cong
+                and not use_bbox_rudy
+            )
 
             proxy_epochs.clear()
             proxy_values.clear()
@@ -1379,6 +1539,8 @@ class GpuPlacer:
             _use_den_schedule = (
                 density_model == "electrostatic" and self._w_density_schedule is not None
             )
+
+            l_ovl = torch.zeros((), device=run_device, dtype=dtype)
 
             for epoch in range(self.epochs):
                 ge = _ed_base + epoch + 1
@@ -1468,6 +1630,15 @@ class GpuPlacer:
 
                 # Congestion: bbox RUDY, pin L-routes (default when pin tables exist), or macro L-routes.
                 with cuda_timer.span("cong_fwd"):
+                    _spatial_cong_active = (
+                        _use_spatial_cong
+                        and self.affine_calibrate
+                        and _hotspot_map is not None
+                        and ge >= _hotspot_min_epoch
+                        and self.w_cong != 0.0
+                        and use_rudy_cong
+                        and not use_bbox_rudy
+                    )
                     if self.w_cong != 0.0:
                         if use_rudy_cong and use_bbox_rudy:
                             demand = _rudy_demand_grid(
@@ -1500,27 +1671,102 @@ class GpuPlacer:
                             V_tot = V_net + (v_blk / gv)
                             both = torch.cat([V_tot.reshape(-1), H_tot.reshape(-1)])
                             l_cong = _abu_top_mean(both, 0.05)
+                        elif (
+                            _use_plc_net_routing
+                            and plc_net_h is not None
+                            and plc_net_v is not None
+                        ):
+                            h_blk, v_blk = _macro_blockage_raw(
+                                full,
+                                benchmark,
+                                nr,
+                                nc,
+                                cw,
+                                ch,
+                                n_hard,
+                                h_ma,
+                                v_ma,
+                            )
+                            h_blk_norm = h_blk / gh.clamp(min=1e-9)
+                            v_blk_norm = v_blk / gv.clamp(min=1e-9)
+                            h_total = h_blk_norm + plc_net_h.detach()
+                            v_total = v_blk_norm + plc_net_v.detach()
+                            both = torch.cat(
+                                [v_total.reshape(-1), h_total.reshape(-1)]
+                            )
+                            l_cong = _abu_top_mean(both, 0.05)
+                            if _spatial_cong_active:
+                                sur_cong_grid = h_total + v_total
+                                l_cong = l_cong + self._hotspot_scale * (
+                                    (sur_cong_grid * _hotspot_map.detach()).sum()
+                                    / float(nr * nc)
+                                )
                         elif use_pin_cong:
-                            l_cong = plc_routing_surrogate_scalar_pins(
-                                combined_pos,
-                                net_idx_pin_cong,
-                                net_mask_pin_cong,
-                                net_valid_pin_cong,
-                                full,
-                                benchmark,
-                                smooth_range=smooth_cong,
-                            )
+                            if _spatial_cong_active:
+                                H_tot, V_tot = plc_routing_surrogate_hv_totals_pins(
+                                    combined_pos,
+                                    net_idx_pin_cong,
+                                    net_mask_pin_cong,
+                                    net_valid_pin_cong,
+                                    full,
+                                    benchmark,
+                                    smooth_range=smooth_cong,
+                                    nr=nr,
+                                    nc=nc,
+                                )
+                                both = torch.cat(
+                                    [V_tot.reshape(-1), H_tot.reshape(-1)]
+                                )
+                                l_cong = _abu_top_mean(both, 0.05)
+                                sur_cong_grid = H_tot + V_tot
+                                l_cong = l_cong + self._hotspot_scale * (
+                                    (sur_cong_grid * _hotspot_map.detach()).sum()
+                                    / float(nr * nc)
+                                )
+                            else:
+                                l_cong = plc_routing_surrogate_scalar_pins(
+                                    combined_pos,
+                                    net_idx_pin_cong,
+                                    net_mask_pin_cong,
+                                    net_valid_pin_cong,
+                                    full,
+                                    benchmark,
+                                    smooth_range=smooth_cong,
+                                )
                         elif use_rudy_cong:
-                            l_cong = plc_routing_surrogate_scalar(
-                                combined_pos,
-                                net_idx_macro,
-                                net_mask_macro,
-                                net_weights_macro,
-                                net_valid_macro,
-                                full,
-                                benchmark,
-                                smooth_range=smooth_cong,
-                            )
+                            if _spatial_cong_active:
+                                H_tot, V_tot = plc_routing_surrogate_hv_totals(
+                                    combined_pos,
+                                    net_idx_macro,
+                                    net_mask_macro,
+                                    net_weights_macro,
+                                    net_valid_macro,
+                                    full,
+                                    benchmark,
+                                    smooth_range=smooth_cong,
+                                    nr=nr,
+                                    nc=nc,
+                                )
+                                both = torch.cat(
+                                    [V_tot.reshape(-1), H_tot.reshape(-1)]
+                                )
+                                l_cong = _abu_top_mean(both, 0.05)
+                                sur_cong_grid = H_tot + V_tot
+                                l_cong = l_cong + self._hotspot_scale * (
+                                    (sur_cong_grid * _hotspot_map.detach()).sum()
+                                    / float(nr * nc)
+                                )
+                            else:
+                                l_cong = plc_routing_surrogate_scalar(
+                                    combined_pos,
+                                    net_idx_macro,
+                                    net_mask_macro,
+                                    net_weights_macro,
+                                    net_valid_macro,
+                                    full,
+                                    benchmark,
+                                    smooth_range=smooth_cong,
+                                )
                         else:
                             l_cong = torch.zeros((), device=run_device, dtype=dtype)
                     else:
@@ -1528,7 +1774,10 @@ class GpuPlacer:
 
                 # Overlap avoidance: penalize pairwise overlap area.
                 with cuda_timer.span("ovl_fwd"):
-                    if self.w_overlap != 0.0:
+                    _compute_ovl = self.w_overlap != 0.0 and (
+                        epoch < 200 or float(l_ovl.detach()) > 0.005
+                    )
+                    if _compute_ovl:
                         l_ovl = _overlap_loss(full)
                     else:
                         l_ovl = torch.zeros((), device=run_device, dtype=dtype)
@@ -1586,7 +1835,11 @@ class GpuPlacer:
 
                 run_meta["epochs_completed"] = epoch + 1
 
-                if self.log_every > 0 and (epoch == 0 or (epoch + 1) % self.log_every == 0):
+                if (
+                    _gpu_placer_verbose()
+                    and self.log_every > 0
+                    and (epoch == 0 or (epoch + 1) % self.log_every == 0)
+                ):
                     lw = float(l_wl.detach().cpu().item())
                     ld = float(l_den.detach().cpu().item())
                     lc = float(l_cong.detach().cpu().item())
@@ -1595,11 +1848,10 @@ class GpuPlacer:
                     surrogate_epochs.append(ge)
                     surrogate_losses.append(ls)
                     wd_note = f" w_den={w_den_run:g}" if _use_den_schedule else ""
-                    print(
+                    _gpu_log(
                         f"[gpu_placer] epoch={ge}/{_epoch_cap_disp} "
                         f"loss={ls:.6g} wl={lw:.6g} den={ld:.6g} cong={lc:.6g} ovl={lo:.6g}{wd_note} "
-                        f"device={run_device.type} bins={nr}x{nc}",
-                        flush=True,
+                        f"device={run_device.type} bins={nr}x{nc}"
                     )
 
                 if surr_stag_enabled and surr_check_every > 0:
@@ -1616,10 +1868,9 @@ class GpuPlacer:
                             rel0 = float(self.stagnation_surrogate_min_rel_initial)
                             if rel0 > 0.0:
                                 surr_stag_min_abs = max(1e-12, rel0 * ls_check)
-                                print(
+                                _gpu_log(
                                     "[gpu_placer] surrogate stagnation threshold: "
-                                    f"{surr_stag_min_abs:.6g} = {rel0:g} × initial_loss {ls_check:.6g}",
-                                    flush=True,
+                                    f"{surr_stag_min_abs:.6g} = {rel0:g} × initial_loss {ls_check:.6g}"
                                 )
                         else:
                             surr_min_abs = (
@@ -1638,13 +1889,12 @@ class GpuPlacer:
                                 surr_stag_streak = 0
                             else:
                                 surr_stag_streak += 1
-                                print(
+                                _gpu_log(
                                     "[gpu_placer] surrogate stagnation: total loss improved only "
                                     f"{delta:.6g} vs best over last {surr_check_every} epochs "
                                     f"(min required {surr_min_abs:g}); "
                                     f"consecutive {surr_stag_streak}/{surr_patience} "
-                                    f"best={surr_stag_best:.6g} current={ls_check:.6g}.",
-                                    flush=True,
+                                    f"best={surr_stag_best:.6g} current={ls_check:.6g}."
                                 )
                                 if surr_stag_streak >= surr_patience:
                                     break
@@ -1668,6 +1918,93 @@ class GpuPlacer:
                             break
                         full_cpu = full.detach().to(device="cpu", dtype=torch.float32)
                         costs = compute_proxy_cost(full_cpu, benchmark, plc)
+
+                        _need_cong_grids = _use_plc_net_routing or (
+                            _use_spatial_cong
+                            and self.affine_calibrate
+                            and ge >= _hotspot_min_epoch
+                        )
+                        if _need_cong_grids:
+                            try:
+                                import numpy as np
+
+                                h_raw_np = np.array(
+                                    plc.get_horizontal_routing_congestion(),
+                                    dtype=np.float32,
+                                ).reshape(nr, nc)
+                                v_raw_np = np.array(
+                                    plc.get_vertical_routing_congestion(),
+                                    dtype=np.float32,
+                                ).reshape(nr, nc)
+                                h_macro_np = np.array(
+                                    plc.H_macro_routing_cong, dtype=np.float32
+                                ).reshape(nr, nc)
+                                v_macro_np = np.array(
+                                    plc.V_macro_routing_cong, dtype=np.float32
+                                ).reshape(nr, nc)
+
+                                if _use_plc_net_routing:
+                                    h_net_only = np.maximum(
+                                        h_raw_np - h_macro_np, 0.0
+                                    )
+                                    v_net_only = np.maximum(
+                                        v_raw_np - v_macro_np, 0.0
+                                    )
+                                    plc_net_h = torch.from_numpy(h_net_only).to(
+                                        device=run_device, dtype=dtype
+                                    )
+                                    plc_net_v = torch.from_numpy(v_net_only).to(
+                                        device=run_device, dtype=dtype
+                                    )
+                                    _gpu_log(
+                                        f"[gpu_placer] plc_net_routing updated: "
+                                        f"H_net mean={h_net_only.mean():.3f} "
+                                        f"max={h_net_only.max():.3f} "
+                                        f"V_net mean={v_net_only.mean():.3f} "
+                                        f"max={v_net_only.max():.3f}"
+                                    )
+
+                                if (
+                                    _use_spatial_cong
+                                    and self.affine_calibrate
+                                    and ge >= _hotspot_min_epoch
+                                ):
+                                    h_t = torch.from_numpy(h_raw_np).to(
+                                        device=run_device, dtype=dtype
+                                    )
+                                    v_t = torch.from_numpy(v_raw_np).to(
+                                        device=run_device, dtype=dtype
+                                    )
+                                    h_excess = torch.relu(h_t - 1.0)
+                                    v_excess = torch.relu(v_t - 1.0)
+                                    new_hotspot = (
+                                        h_excess * _hotspot_h_weight
+                                        + v_excess * _hotspot_v_weight
+                                    )
+                                    alpha = float(self._hotspot_map_alpha)
+                                    if _hotspot_map is None:
+                                        _hotspot_map = new_hotspot
+                                    else:
+                                        _hotspot_map = (
+                                            (1.0 - alpha) * _hotspot_map
+                                            + alpha * new_hotspot
+                                        )
+                                    n_hot_h = int((h_t > 1.0).sum().item())
+                                    n_hot_v = int((v_t > 1.0).sum().item())
+                                    _gpu_log(
+                                        f"[gpu_placer] hotspot_map updated: "
+                                        f"H_overloaded={n_hot_h} V_overloaded={n_hot_v} "
+                                        f"H_max={h_t.max().item():.3f} "
+                                        f"V_max={v_t.max().item():.3f}"
+                                    )
+                            except Exception as e:
+                                _gpu_log(
+                                    f"[gpu_placer] plc congestion grids update failed: {e}"
+                                )
+                                if _use_plc_net_routing:
+                                    plc_net_h = None
+                                    plc_net_v = None
+
                         px_proxy = float(costs["proxy_cost"])
                         px_wl = float(costs["wirelength_cost"])
                         px_den = float(costs["density_cost"])
@@ -1725,6 +2062,34 @@ class GpuPlacer:
                         err_den = al_den - px_den
                         err_cong = al_cong - px_cong
 
+                        if _restore_best and (
+                            best_proxy_restore is None or px_proxy < best_proxy_restore
+                        ):
+                            best_proxy_restore = float(px_proxy)
+                            if pos_hard.numel() > 0:
+                                best_hard_restore = pos_hard.detach().clone()
+                            if pos_soft.numel() > 0:
+                                best_soft_restore = pos_soft.detach().clone()
+
+                        if on_proxy_check is not None:
+                            on_proxy_check(
+                                epoch=ge,
+                                px_proxy=px_proxy,
+                                best_proxy=float(
+                                    best_proxy_restore
+                                    if best_proxy_restore is not None
+                                    else px_proxy
+                                ),
+                                ema_w_wl=float(ema_w_wl),
+                                ema_w_cong=float(ema_w_cong),
+                                err_wl=float(err_wl),
+                                err_cong=float(err_cong),
+                                al_wl=float(al_wl),
+                                al_cong=float(al_cong),
+                                px_wl=float(px_wl),
+                                px_cong=float(px_cong),
+                            )
+
                         if proxy_log_mode != "off":
                             _print_proxy_check_report(
                                 epoch=ge,
@@ -1746,6 +2111,81 @@ class GpuPlacer:
                                 al_cong=al_cong,
                                 al_sum=al_sum,
                                 mode=proxy_log_mode,
+                            )
+
+                        if _gpu_placer_verbose() and _hotspot_map is not None:
+                            hot_bins = int((_hotspot_map > 0.01).sum().item())
+                            hot_max = float(_hotspot_map.max().item())
+                            _gpu_log(
+                                f"[gpu_placer] hotspot: {hot_bins} active bins, "
+                                f"max_weight={hot_max:.3f}"
+                            )
+
+                        if (
+                            _gpu_placer_verbose()
+                            and _use_plc_net_routing
+                            and plc_net_h is not None
+                            and plc_net_v is not None
+                        ):
+                            h_blk_log, v_blk_log = _macro_blockage_raw(
+                                full,
+                                benchmark,
+                                nr,
+                                nc,
+                                cw,
+                                ch,
+                                n_hard,
+                                h_ma,
+                                v_ma,
+                            )
+                            h_tot_log = h_blk_log / gh.clamp(min=1e-9) + plc_net_h
+                            v_tot_log = v_blk_log / gv.clamp(min=1e-9) + plc_net_v
+                            both_log = torch.cat(
+                                [v_tot_log.reshape(-1), h_tot_log.reshape(-1)]
+                            )
+                            sur_cong_plc = float(
+                                _abu_top_mean(both_log, 0.05).detach().cpu().item()
+                            )
+                            err_plc = sur_cong_plc - px_cong
+                            err_lroute = sur_cong - px_cong
+                            if use_pin_cong:
+                                sur_lroute = float(
+                                    plc_routing_surrogate_scalar_pins(
+                                        combined_pos,
+                                        net_idx_pin_cong,
+                                        net_mask_pin_cong,
+                                        net_valid_pin_cong,
+                                        full,
+                                        benchmark,
+                                        smooth_range=smooth_cong,
+                                    )
+                                    .detach()
+                                    .cpu()
+                                    .item()
+                                )
+                            elif use_rudy_cong:
+                                sur_lroute = float(
+                                    plc_routing_surrogate_scalar(
+                                        combined_pos,
+                                        net_idx_macro,
+                                        net_mask_macro,
+                                        net_weights_macro,
+                                        net_valid_macro,
+                                        full,
+                                        benchmark,
+                                        smooth_range=smooth_cong,
+                                    )
+                                    .detach()
+                                    .cpu()
+                                    .item()
+                                )
+                            else:
+                                sur_lroute = sur_cong
+                            _gpu_log(
+                                f"[gpu_placer] plc_net_cong: surrogate={sur_cong_plc:.4f} "
+                                f"px_cong={px_cong:.4f} err={err_plc:+.4f} "
+                                f"(was {err_lroute:+.4f} with L-route, "
+                                f"L-route sur={sur_lroute:.4f})"
                             )
 
                         px_proxy_prev = float(px_proxy)
@@ -1782,18 +2222,39 @@ class GpuPlacer:
                                 if delta >= min_abs:
                                     stag_best = float(px_proxy)
                                     stag_streak = 0
+                                    switched_to_sgd = False
                                 else:
                                     stag_streak += 1
-                                    print(
+                                    _gpu_log(
                                         "[gpu_placer] stagnation: PLC proxy improved only "
                                         f"{delta:.6g} vs best over last "
                                         f"{proxy_check_every} epochs "
                                         f"(min required {min_abs:g}); "
                                         f"consecutive {stag_streak}/{min_abs_patience} "
-                                        f"best={stag_best:.6g} current={px_proxy:.6g}.",
-                                        flush=True,
+                                        f"best={stag_best:.6g} current={px_proxy:.6g}."
                                     )
-                                    if stag_streak >= min_abs_patience:
+                                    if (
+                                        self.late_stagnation_sgd_switch
+                                        and not switched_to_sgd
+                                        and stag_streak >= stagnation_switch_threshold
+                                        and min_abs_patience > 1
+                                    ):
+                                        ratio_raw = os.environ.get(
+                                            "MACRO_PLACE_GPU_SGD_LR_RATIO", "0.2"
+                                        )
+                                        try:
+                                            ratio = float((ratio_raw or "0.2").strip())
+                                        except ValueError:
+                                            ratio = 0.2
+                                        lr_sgd = self.lr * ratio
+                                        opt = _switch_to_sgd(params, lr_sgd)
+                                        stag_streak = 0
+                                        switched_to_sgd = True
+                                        _gpu_log(
+                                            "[gpu_placer] stagnation counter reset after "
+                                            "optimizer switch."
+                                        )
+                                    elif stag_streak >= min_abs_patience:
                                         break
                         elif self.stagnation_proxy_patience > 0:
                             thr = max(
@@ -1809,14 +2270,24 @@ class GpuPlacer:
                             else:
                                 stag_streak += 1
                                 if stag_streak >= self.stagnation_proxy_patience:
-                                    print(
+                                    _gpu_log(
                                         "[gpu_placer] stagnation: PLC proxy did not improve by "
                                         f"rel>{self.stagnation_proxy_rel_delta} for "
                                         f"{self.stagnation_proxy_patience} consecutive checks "
-                                        f"(best={stag_best:.6g}, current={px_proxy:.6g}).",
-                                        flush=True,
+                                        f"(best={stag_best:.6g}, current={px_proxy:.6g})."
                                     )
                                     break
+            if _restore_best:
+                if best_hard_restore is not None and pos_hard.numel() > 0:
+                    pos_hard.data.copy_(best_hard_restore.to(pos_hard.device))
+                if best_soft_restore is not None and pos_soft.numel() > 0:
+                    pos_soft.data.copy_(best_soft_restore.to(pos_soft.device))
+                full = _assemble_full_fast(pos_hard, pos_soft, assemble_ctx)
+                if best_proxy_restore is not None:
+                    _gpu_log(
+                        "[gpu_placer] restored best-proxy placement "
+                        f"(proxy={best_proxy_restore:.6g}) before exit."
+                    )
             cuda_timer.report(int(run_meta.get("epochs_completed", 0)))
             return full
 
@@ -1902,6 +2373,13 @@ class GpuPlacer:
             )
         # Preserve fixed macros exactly.
         out[fixed] = benchmark.macro_positions[fixed]
+        _gpu_print_final_summary(
+            benchmark=benchmark,
+            full=out,
+            plc=plc,
+            elapsed=float(t_train1 - t_train0),
+            epochs=int(run_meta.get("epochs_completed", 0)),
+        )
         return out
 
 

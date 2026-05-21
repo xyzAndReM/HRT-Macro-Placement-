@@ -5,6 +5,8 @@ PLC-aligned routing congestion.
   centers (GPU-batched).
 * ``plc_routing_surrogate_scalar_pins`` — pin offsets on hard macros, batched L-routes,
   PLC-aligned route weights (GPU; no per-net Python loop).
+* ``plc_routing_surrogate_hv_totals_pins`` / ``plc_routing_surrogate_util_grid_pins`` —
+  per-cell H/V utilization grids (before ABU reduction) for spatial hotspot loss.
 * ``plc_routing_surrogate_discrete_pins`` — evaluator-quality discrete pin routing
   (CPU-oriented); smooth + ABU(0.05) like ``get_congestion_cost``.
 """
@@ -919,7 +921,7 @@ def plc_routing_surrogate_discrete_pins(
     return _abu_top_mean(both, float(abu_frac))
 
 
-def plc_routing_surrogate_scalar(
+def plc_routing_surrogate_hv_totals(
     combined_pos: torch.Tensor,
     net_idx: torch.Tensor,
     net_mask: torch.Tensor,
@@ -929,15 +931,14 @@ def plc_routing_surrogate_scalar(
     benchmark: "Benchmark",
     *,
     smooth_range: Optional[int] = None,
-    abu_frac: float = 0.05,
     nr: Optional[int] = None,
     nc: Optional[int] = None,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Scalar congestion matching ``get_congestion_cost`` reduction: mean of top ``abu_frac``
-    fraction of all smoothed-then-macro-added normalized H and V cell utilizations (concatenated).
+    Smoothed, normalized H/V routing utilization per bin (net L-routes + macro blockage).
 
-    Gradients flow via soft row/column interpolation on L-route deposits.
+    Same pipeline as ``plc_routing_surrogate_scalar`` but returns ``(H_tot, V_tot)``
+    before the ABU scalar reduction.
     """
     device = combined_pos.device
     dtype = combined_pos.dtype
@@ -1008,17 +1009,43 @@ def plc_routing_surrogate_scalar(
     h_blk = h_blk / gh
     v_blk = v_blk / gv
 
-    H_tot = H_net + h_blk
-    V_tot = V_net + v_blk
-
-    both = torch.cat([V_tot.reshape(-1), H_tot.reshape(-1)])
-    return _abu_top_mean(both, float(abu_frac))
+    return H_net + h_blk, V_net + v_blk
 
 
-def plc_routing_surrogate_scalar_pins(
+def plc_routing_surrogate_util_grid(
     combined_pos: torch.Tensor,
-    pin_net_idx: torch.Tensor,
-    pin_net_mask: torch.Tensor,
+    net_idx: torch.Tensor,
+    net_mask: torch.Tensor,
+    net_weights: torch.Tensor,
+    net_valid: torch.Tensor,
+    full_macro_pos: torch.Tensor,
+    benchmark: "Benchmark",
+    *,
+    smooth_range: Optional[int] = None,
+    nr: Optional[int] = None,
+    nc: Optional[int] = None,
+) -> torch.Tensor:
+    """Per-bin ``H_tot + V_tot`` utilization grid (macro-center L-routes)."""
+    H_tot, V_tot = plc_routing_surrogate_hv_totals(
+        combined_pos,
+        net_idx,
+        net_mask,
+        net_weights,
+        net_valid,
+        full_macro_pos,
+        benchmark,
+        smooth_range=smooth_range,
+        nr=nr,
+        nc=nc,
+    )
+    return H_tot + V_tot
+
+
+def plc_routing_surrogate_scalar(
+    combined_pos: torch.Tensor,
+    net_idx: torch.Tensor,
+    net_mask: torch.Tensor,
+    net_weights: torch.Tensor,
     net_valid: torch.Tensor,
     full_macro_pos: torch.Tensor,
     benchmark: "Benchmark",
@@ -1029,9 +1056,40 @@ def plc_routing_surrogate_scalar_pins(
     nc: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    Differentiable congestion with **pin** L-routes (offsets on hard macros), same
-    normalize → smooth → macro blockage → ABU reduction as ``plc_routing_surrogate_scalar``.
+    Scalar congestion matching ``get_congestion_cost`` reduction: mean of top ``abu_frac``
+    fraction of all smoothed-then-macro-added normalized H and V cell utilizations (concatenated).
+
+    Gradients flow via soft row/column interpolation on L-route deposits.
     """
+    H_tot, V_tot = plc_routing_surrogate_hv_totals(
+        combined_pos,
+        net_idx,
+        net_mask,
+        net_weights,
+        net_valid,
+        full_macro_pos,
+        benchmark,
+        smooth_range=smooth_range,
+        nr=nr,
+        nc=nc,
+    )
+    both = torch.cat([V_tot.reshape(-1), H_tot.reshape(-1)])
+    return _abu_top_mean(both, float(abu_frac))
+
+
+def plc_routing_surrogate_hv_totals_pins(
+    combined_pos: torch.Tensor,
+    pin_net_idx: torch.Tensor,
+    pin_net_mask: torch.Tensor,
+    net_valid: torch.Tensor,
+    full_macro_pos: torch.Tensor,
+    benchmark: "Benchmark",
+    *,
+    smooth_range: Optional[int] = None,
+    nr: Optional[int] = None,
+    nc: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pin L-route H/V utilization grids before ABU reduction."""
     device = combined_pos.device
     dtype = combined_pos.dtype
     cw = float(benchmark.canvas_width)
@@ -1100,7 +1158,63 @@ def plc_routing_surrogate_scalar_pins(
     h_blk = h_blk / gh
     v_blk = v_blk / gv
 
-    H_tot = H_net + h_blk
-    V_tot = V_net + v_blk
+    return H_net + h_blk, V_net + v_blk
+
+
+def plc_routing_surrogate_util_grid_pins(
+    combined_pos: torch.Tensor,
+    pin_net_idx: torch.Tensor,
+    pin_net_mask: torch.Tensor,
+    net_valid: torch.Tensor,
+    full_macro_pos: torch.Tensor,
+    benchmark: "Benchmark",
+    *,
+    smooth_range: Optional[int] = None,
+    nr: Optional[int] = None,
+    nc: Optional[int] = None,
+) -> torch.Tensor:
+    """Per-bin ``H_tot + V_tot`` utilization grid (pin L-routes)."""
+    H_tot, V_tot = plc_routing_surrogate_hv_totals_pins(
+        combined_pos,
+        pin_net_idx,
+        pin_net_mask,
+        net_valid,
+        full_macro_pos,
+        benchmark,
+        smooth_range=smooth_range,
+        nr=nr,
+        nc=nc,
+    )
+    return H_tot + V_tot
+
+
+def plc_routing_surrogate_scalar_pins(
+    combined_pos: torch.Tensor,
+    pin_net_idx: torch.Tensor,
+    pin_net_mask: torch.Tensor,
+    net_valid: torch.Tensor,
+    full_macro_pos: torch.Tensor,
+    benchmark: "Benchmark",
+    *,
+    smooth_range: Optional[int] = None,
+    abu_frac: float = 0.05,
+    nr: Optional[int] = None,
+    nc: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Differentiable congestion with **pin** L-routes (offsets on hard macros), same
+    normalize → smooth → macro blockage → ABU reduction as ``plc_routing_surrogate_scalar``.
+    """
+    H_tot, V_tot = plc_routing_surrogate_hv_totals_pins(
+        combined_pos,
+        pin_net_idx,
+        pin_net_mask,
+        net_valid,
+        full_macro_pos,
+        benchmark,
+        smooth_range=smooth_range,
+        nr=nr,
+        nc=nc,
+    )
     both = torch.cat([V_tot.reshape(-1), H_tot.reshape(-1)])
     return _abu_top_mean(both, float(abu_frac))

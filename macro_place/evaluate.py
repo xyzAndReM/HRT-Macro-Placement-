@@ -213,6 +213,48 @@ def evaluate_benchmark(
 # ── Pretty-printing ─────────────────────────────────────────────────────────
 
 
+def _eval_verbose() -> bool:
+    """Default quiet; set ``MACRO_PLACE_EVAL_VERBOSE=1`` for banners and per-term tables."""
+    return os.environ.get("MACRO_PLACE_EVAL_VERBOSE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _eval_validity_status(overlaps: int) -> str:
+    if overlaps == 0:
+        return "VALID"
+    return f"INVALID ({overlaps} overlaps)"
+
+
+def _print_eval_quiet(results: list[dict]) -> None:
+    """One line per benchmark (proxy + elapsed + validity); avg + total when multiple."""
+    if len(results) == 1:
+        r = results[0]
+        status = _eval_validity_status(int(r["overlaps"]))
+        print(
+            f"proxy={r['proxy_cost']:.4f} elapsed={r['runtime']:.1f}s {status}",
+            flush=True,
+        )
+        return
+    total_runtime = sum(r["runtime"] for r in results)
+    for r in results:
+        status = _eval_validity_status(int(r["overlaps"]))
+        print(
+            f"{r['name']} proxy={r['proxy_cost']:.4f} elapsed={r['runtime']:.1f}s {status}",
+            flush=True,
+        )
+    avg_proxy = sum(r["proxy_cost"] for r in results) / len(results)
+    total_overlaps = sum(r["overlaps"] for r in results)
+    summary_status = _eval_validity_status(int(total_overlaps))
+    print(
+        f"avg proxy={avg_proxy:.4f} elapsed={total_runtime:.1f}s {summary_status}",
+        flush=True,
+    )
+
+
 def _print_summary_table(results):
     """Print a multi-benchmark comparison table."""
     has_baselines = any(r["sa_baseline"] is not None for r in results)
@@ -365,6 +407,10 @@ def main():
     )
     args = parser.parse_args()
 
+    verbose = _eval_verbose()
+    if not verbose:
+        os.environ.setdefault("MACRO_PLACE_EVAL_QUIET", "1")
+
     # ── resolve paths ────────────────────────────────────────────────────
     testcase_root = Path("external/MacroPlacement/Testcases/ICCAD04")
     if not args.ng45 and not testcase_root.exists():
@@ -396,12 +442,13 @@ def main():
         placer_abs = str(placer_path.resolve())
         cwd = Path.cwd()
         rc_max = 0
-        print(
-            "evaluate · --all · one subprocess per benchmark (clean CUDA context). "
-            "Use --no-isolate-all to run in a single process.",
-            flush=True,
-        )
-        print()
+        if verbose:
+            print(
+                "evaluate · --all · one subprocess per benchmark (clean CUDA context). "
+                "Use --no-isolate-all to run in a single process.",
+                flush=True,
+            )
+            print()
         for name in benchmarks_to_run:
             cmd = [
                 sys.executable,
@@ -430,7 +477,7 @@ def main():
         "yes",
         "on",
     )
-    if show_banner:
+    if show_banner and verbose:
         print("=" * 80)
         print(f"evaluate · {placer_name}  ({placer_path})")
         print("=" * 80)
@@ -438,24 +485,26 @@ def main():
 
     results = []
     for name in benchmarks_to_run:
-        print(f"  {name}...", end=" ", flush=True)
+        if verbose:
+            print(f"  {name}...", end=" ", flush=True)
         ng45_dir = NG45_BENCHMARKS.get(name) if args.ng45 or name in NG45_BENCHMARKS else None
         result = evaluate_benchmark(placer, name, str(testcase_root), ng45_dir=ng45_dir)
         results.append(result)
 
-        status = (
-            "VALID"
-            if result["overlaps"] == 0
-            else f"INVALID ({result['overlaps']} overlaps)"
-        )
-        dpi = result["proxy_cost_initial"]
-        dp = result["proxy_cost"]
-        dlt = _proxy_delta_pct(dpi, dp)
-        print(
-            f"proxy={dp:.4f}  initial={dpi:.4f}  delta={dlt:+.2f}%  "
-            f"(wl={result['wirelength']:.3f} den={result['density']:.3f} cong={result['congestion']:.3f})  "
-            f"{status}  [{result['runtime']:.2f}s]"
-        )
+        if verbose:
+            status = (
+                "VALID"
+                if result["overlaps"] == 0
+                else f"INVALID ({result['overlaps']} overlaps)"
+            )
+            dpi = result["proxy_cost_initial"]
+            dp = result["proxy_cost"]
+            dlt = _proxy_delta_pct(dpi, dp)
+            print(
+                f"proxy={dp:.4f}  initial={dpi:.4f}  delta={dlt:+.2f}%  "
+                f"(wl={result['wirelength']:.3f} den={result['density']:.3f} cong={result['congestion']:.3f})  "
+                f"{status}  [{result['runtime']:.2f}s]"
+            )
 
         _cuda_between_benchmark_runs()
 
@@ -465,8 +514,11 @@ def main():
             save_path = str(vis_dir / f"{name}.png")
             visualize_placement(result["placement"], result["benchmark"], save_path=save_path, plc=result.get("plc"))
 
-    if len(results) > 1:
-        _print_summary_table(results)
+    if verbose:
+        if len(results) > 1:
+            _print_summary_table(results)
+    else:
+        _print_eval_quiet(results)
 
 
 if __name__ == "__main__":

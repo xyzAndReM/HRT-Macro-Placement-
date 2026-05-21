@@ -1105,6 +1105,28 @@ def randomize_movable_macro_centers(benchmark: Benchmark, *, seed: int | None = 
         pos[i, 1] = h + torch.rand((), device=dev, dtype=dt) * span_y
 
 
+def randomize_movable_hard_macro_centers(benchmark: Benchmark, *, seed: int | None = None) -> None:
+    """Uniform random center for each movable **hard** macro; soft macros and fixed macros unchanged."""
+    if seed is not None:
+        torch.manual_seed(int(seed))
+    pos = benchmark.macro_positions
+    sizes = benchmark.macro_sizes
+    fixed = benchmark.macro_fixed
+    dev, dt = pos.device, pos.dtype
+    cw = float(benchmark.canvas_width)
+    ch = float(benchmark.canvas_height)
+    n_hard = int(benchmark.num_hard_macros)
+    for i in range(n_hard):
+        if bool(fixed[i].item()):
+            continue
+        w = float(sizes[i, 0].item()) * 0.5
+        h = float(sizes[i, 1].item()) * 0.5
+        span_x = max(cw - 2.0 * w, 1e-9)
+        span_y = max(ch - 2.0 * h, 1e-9)
+        pos[i, 0] = w + torch.rand((), device=dev, dtype=dt) * span_x
+        pos[i, 1] = h + torch.rand((), device=dev, dtype=dt) * span_y
+
+
 class GradientPlacer:
     """
     Differentiable placement (Adam + smooth losses), then optional ``QPLegalizer``.
