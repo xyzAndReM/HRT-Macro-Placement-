@@ -46,8 +46,7 @@ Env:
        hard macros only (soft macros and fixed macros stay at loader positions)
     MACRO_PLACE_LIQUID_RANDOM_HARD_SEED — optional RNG seed for random hard start
     MACRO_PLACE_LIQUID_SAVE_PLACEMENT — optional: save post-Abbacus placement to ``1`` →
-       ``logs/liquid_<benchmark>_placement.pt``, or a file path. Run SA separately via
-       ``scripts/run_sa_on_placement.py``.
+       ``logs/liquid_<benchmark>_placement.pt``, or a file path.
     Liquid **defaults** (no manual env needed): ``MACRO_PLACE_GPU_PLC_NET_ROUTING=0``,
     ``MACRO_PLACE_GPU_SPATIAL_CONG=0`` for the whole placement run (L-route congestion only).
 

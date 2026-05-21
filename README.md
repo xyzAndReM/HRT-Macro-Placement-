@@ -160,6 +160,100 @@ Benchmark     Proxy        SA   RePlAce     vs SA  vs RePlAce  Overlaps
 
 The greedy placer achieves zero overlaps but makes no attempt to optimize wirelength or connectivity — your job is to do better! See [`SETUP.md`](SETUP.md) for the full API reference and [`submissions/examples/`](submissions/examples/) for working examples.
 
+## Liquid placer (`submissions/liquid.py`)
+
+**Liquid** is a GPU placement pipeline that alternates two differentiable phases, then legalizes hard macros. It is a good starting point if you want a fast, proxy-driven flow on ICCAD04 benchmarks.
+
+### How it works
+
+Each **cycle** (default: one cycle) runs in order:
+
+1. **Liquid GPU** (`GpuPlacer`) — optimizes a smooth surrogate (wirelength, density, overlap, L-route congestion). No PLC proxy checks during this phase. Stops when surrogate loss fails to improve by at least `0.001 ×` the initial loss for one check (every 50 epochs), or when the epoch cap is hit (default 20,000).
+2. **Patience GPU** (`GpuPlacer`) — same surrogate plus **PLC proxy** checks every 50 epochs, with scale-only calibration of surrogate weights to match proxy wirelength/density/congestion. Stops on PLC proxy stagnation (default: less than `0.0001` improvement vs. session best for one consecutive check), or at the epoch cap. After enough stagnation checks, it can switch to plain SGD for late refinement.
+3. **Cycle gate** — if proxy cost got worse after liquid + patience, the placement from before the cycle is restored and further cycles stop. Otherwise another cycle may run (up to `MACRO_PLACE_LIQUID_CYCLES`).
+4. **Abbacus** — hard-macro legalization (`AbbacusLegalizer`).
+5. **Optional QP** — if `MACRO_PLACE_LIQUID_QP_IF_OVERLAPS=1`, runs `QPLegalizer` only when hard macros still overlap after Abbacus.
+
+Liquid forces **L-route congestion** for the whole run (`MACRO_PLACE_GPU_PLC_NET_ROUTING=0`, `MACRO_PLACE_GPU_SPATIAL_CONG=0`). Patience uses PLC proxy for quality; liquid phase does not.
+
+```mermaid
+flowchart LR
+  A[Liquid GPU\nsurrogate only] --> B[Patience GPU\nsurrogate + PLC proxy]
+  B --> C{Proxy worse\nthan pre-cycle?}
+  C -->|yes| D[Restore snapshot\nstop cycles]
+  C -->|no| E{More cycles?}
+  E -->|yes| A
+  E -->|no| F[Abbacus legalize]
+  F --> G[Optional QP\nif overlaps]
+```
+
+### Run Liquid
+
+From the repo root (after `uv sync` and `git submodule update --init external/MacroPlacement`):
+
+```bash
+# Single benchmark (default: ibm01)
+uv run evaluate submissions/liquid.py -b ibm01
+
+# All IBM benchmarks (one subprocess per design by default — safer for CUDA)
+uv run evaluate submissions/liquid.py --all
+
+# Skip placement PNGs
+uv run evaluate submissions/liquid.py -b ibm01 --no-vis
+```
+
+On **Windows PowerShell**, set `PYTHONPATH` so `submissions` imports resolve:
+
+```powershell
+cd path\to\HRT-Macro-Placement-
+$env:PYTHONPATH = "."
+uv run evaluate submissions/liquid.py -b ibm01
+```
+
+**Default output** is one line per benchmark (proxy, elapsed time, validity):
+
+```
+proxy=0.8234 elapsed=45.1s VALID
+```
+
+**Verbose logging** (phase logs, per-epoch GPU logs, proxy tables):
+
+```bash
+export MACRO_PLACE_EVAL_VERBOSE=1
+export MACRO_PLACE_LIQUID_VERBOSE=1
+export MACRO_PLACE_GPU_VERBOSE=1
+uv run evaluate submissions/liquid.py -b ibm01
+```
+
+Requires **CUDA** for practical runtimes unless you force CPU via `MACRO_PLACE_DEVICE=cpu`.
+
+### Useful environment variables
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MACRO_PLACE_LIQUID_CYCLES` | `1` | Max liquid → patience pairs per placement |
+| `MACRO_PLACE_LIQUID_GPU_EPOCHS` | `20000` | Liquid phase epoch cap (`0` skips liquid) |
+| `MACRO_PLACE_LIQUID_PATIENCE_EPOCHS` | `20000` | Patience phase epoch cap |
+| `MACRO_PLACE_LIQUID_LR` | `1e-2` | Learning rate for both GPU phases |
+| `MACRO_PLACE_LIQUID_W_DENSITY` | `0.8` | Liquid-phase density weight |
+| `MACRO_PLACE_LIQUID_PATIENCE_W_DENSITY` | `0.5` | Patience-phase density weight |
+| `MACRO_PLACE_LIQUID_W_OVERLAP` | `0.5` | Liquid-phase overlap weight |
+| `MACRO_PLACE_LIQUID_PROXY_CHECK_EVERY` | `50` | Patience PLC proxy check interval (epochs) |
+| `MACRO_PLACE_LIQUID_STAGNATION_MIN_ABS` | `0.0001` | Min PLC proxy improvement per check (patience) |
+| `MACRO_PLACE_LIQUID_STAGNATION_PATIENCE` | `1` | Consecutive sub-threshold proxy checks before stop |
+| `MACRO_PLACE_LIQUID_SURROGATE_CHECK_EVERY` | `50` | Liquid surrogate stagnation check interval |
+| `MACRO_PLACE_LIQUID_SURROGATE_STAG_PATIENCE` | `1` | Consecutive sub-threshold surrogate checks before stop |
+| `MACRO_PLACE_LIQUID_QP_IF_OVERLAPS` | off | Run QP legalizer after Abbacus if overlaps remain |
+| `MACRO_PLACE_LIQUID_RANDOM_HARD_START` | off | Randomize movable hard-macro centers at start |
+| `MACRO_PLACE_LIQUID_SAVE_PLACEMENT` | off | Save checkpoint to `logs/liquid_<bench>_placement.pt` |
+| `MACRO_PLACE_EVAL_VERBOSE` | off | Full evaluate tables and per-term breakdown |
+| `MACRO_PLACE_LIQUID_VERBOSE` | off | Liquid cycle / phase console logs |
+| `MACRO_PLACE_GPU_VERBOSE` | off | GpuPlacer training and proxy-check logs |
+
+With `MACRO_PLACE_LIQUID_VERBOSE=1`, proxy-check rows are written to `logs/liquid_<benchmark>_proxycheck.csv` and a short congestion summary to `logs/liquid_<benchmark>_congestion.md`.
+
+Implementation details and the full env list are in the module docstring at [`submissions/liquid.py`](submissions/liquid.py). Core GPU logic lives in [`submissions/gpu/placer.py`](submissions/gpu/placer.py).
+
 ## 🎯 IBM Benchmark Suite (ICCAD04)
 
 We evaluate on the complete ICCAD04 IBM benchmark suite:
@@ -213,6 +307,7 @@ Classical methods (SA, RePlAce) have been refined for decades but still have roo
 ## 📖 Documentation
 
 - **Setup & API Reference**: [`SETUP.md`](SETUP.md) - Infrastructure details, benchmark format, cost computation, testing
+- **Liquid placer**: [`submissions/liquid.py`](submissions/liquid.py) — GPU liquid → patience → Abbacus pipeline (see [Liquid placer](#liquid-placer-submissionsliquidpy) above)
 - **Example Submissions**: [`submissions/examples/`](submissions/examples/) - Working placer examples
 
 ## 📚 References
